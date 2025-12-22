@@ -115,29 +115,39 @@ class UsageStats(BaseModel):
 
 # Helper Functions
 def initialize_demo_keys():
-    """Initialize demo API keys for testing"""
-    demo_keys = [
-        {
-            "key": "demo-admin-key-12345",
+    """Initialize demo API keys from environment variables"""
+    demo_keys = []
+    
+    # Load admin key from environment
+    admin_key = os.getenv("DEMO_ADMIN_KEY")
+    if admin_key:
+        demo_keys.append({
+            "key": admin_key,
             "name": "Demo Admin Key",
             "role": "admin",
             "rate_limit": 1000,
             "created_at": datetime.now().isoformat()
-        },
-        {
-            "key": "demo-user-key-67890",
+        })
+    
+    # Load user key from environment
+    user_key = os.getenv("DEMO_USER_KEY")
+    if user_key:
+        demo_keys.append({
+            "key": user_key,
             "name": "Demo User Key",
             "role": "user",
             "rate_limit": 100,
             "created_at": datetime.now().isoformat()
-        }
-    ]
+        })
     
     for key_data in demo_keys:
         API_KEYS[key_data["key"]] = key_data
         USAGE_STATS[key_data["key"]] = []
     
-    logger.info(f"Initialized {len(demo_keys)} demo API keys")
+    if demo_keys:
+        logger.info(f"Initialized {len(demo_keys)} demo API keys from environment")
+    else:
+        logger.warning("No demo API keys found in environment. Set DEMO_ADMIN_KEY and DEMO_USER_KEY to enable demo keys.")
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Create JWT access token"""

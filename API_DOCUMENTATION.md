@@ -24,14 +24,16 @@ Authorization: Bearer <your-api-key>
 
 ### Getting an API Key
 
-Contact your administrator to create an API key for you, or use the demo keys:
+Contact your administrator to create an API key for you. For testing, you can set demo keys in your `.env` file:
 
-**Demo Admin Key:**
-```
-```
+**Demo Keys Configuration:**
+```bash
+# In .env file:
+DEMO_ADMIN_KEY=<your-generated-admin-key>
+DEMO_USER_KEY=<your-generated-user-key>
 
-**Demo User Key:**
-```
+# Generate secure keys with:
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 ### Roles
@@ -156,7 +158,7 @@ Create a new API key
 **cURL Example:**
 ```bash
 curl -X POST "http://localhost:8000/api/keys" \
-  -H "Authorization: Bearer demo-admin-key-12345" \
+  -H "Authorization: Bearer <your-admin-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Production API Key",
@@ -177,7 +179,7 @@ List all API keys
 {
   "api_keys": [
     {
-      "key_preview": "demo-admin-key-1234...",
+      "key_preview": "<admin-key-preview>...",
       "name": "Demo Admin Key",
       "role": "admin",
       "rate_limit": 1000,
@@ -191,7 +193,7 @@ List all API keys
 **cURL Example:**
 ```bash
 curl -X GET "http://localhost:8000/api/keys" \
-  -H "Authorization: Bearer demo-admin-key-12345"
+  -H "Authorization: Bearer <your-admin-api-key>"
 ```
 
 ---
@@ -213,8 +215,8 @@ Revoke an API key
 
 **cURL Example:**
 ```bash
-curl -X DELETE "http://localhost:8000/api/keys/demo-user-key-67890" \
-  -H "Authorization: Bearer demo-admin-key-12345"
+curl -X DELETE "http://localhost:8000/api/keys/<your-user-api-key>" \
+  -H "Authorization: Bearer <your-admin-api-key>"
 ```
 
 ---
@@ -249,7 +251,7 @@ List available Ollama models
 **cURL Example:**
 ```bash
 curl -X GET "http://localhost:8000/api/models" \
-  -H "Authorization: Bearer demo-user-key-67890"
+  -H "Authorization: Bearer <your-user-api-key>"
 ```
 
 ---
@@ -294,7 +296,7 @@ Generate text using an Ollama model
 **cURL Example:**
 ```bash
 curl -X POST "http://localhost:8000/api/generate" \
-  -H "Authorization: Bearer demo-user-key-67890" \
+  -H "Authorization: Bearer <your-user-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama2",
@@ -311,7 +313,7 @@ import requests
 response = requests.post(
     "http://localhost:8000/api/generate",
     headers={
-        "Authorization": "Bearer demo-user-key-67890",
+        "Authorization": "Bearer <your-user-api-key>",
         "Content-Type": "application/json"
     },
     json={
@@ -376,7 +378,7 @@ Chat with an Ollama model
 **cURL Example:**
 ```bash
 curl -X POST "http://localhost:8000/api/chat" \
-  -H "Authorization: Bearer demo-user-key-67890" \
+  -H "Authorization: Bearer <your-user-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama2",
@@ -406,7 +408,7 @@ messages = [
 response = requests.post(
     "http://localhost:8000/api/chat",
     headers={
-        "Authorization": "Bearer demo-user-key-67890",
+        "Authorization": "Bearer <your-user-api-key>",
         "Content-Type": "application/json"
     },
     json={
@@ -449,7 +451,7 @@ Get usage statistics for your API key
 **cURL Example:**
 ```bash
 curl -X GET "http://localhost:8000/api/stats" \
-  -H "Authorization: Bearer demo-user-key-67890"
+  -H "Authorization: Bearer <your-user-api-key>"
 ```
 
 ---
@@ -463,13 +465,13 @@ Get usage statistics for all API keys
 ```json
 {
   "statistics": {
-    "demo-admin-key-1234...": {
+    "<admin-key-preview>...": {
       "key_name": "Demo Admin Key",
       "role": "admin",
       "total_requests": 15,
       "last_request": "2025-12-22T10:25:00.000000"
     },
-    "demo-user-key-67890...": {
+    "<your-user-api-key>...": {
       "key_name": "Demo User Key",
       "role": "user",
       "total_requests": 42,
@@ -482,7 +484,7 @@ Get usage statistics for all API keys
 **cURL Example:**
 ```bash
 curl -X GET "http://localhost:8000/api/admin/stats" \
-  -H "Authorization: Bearer demo-admin-key-12345"
+  -H "Authorization: Bearer <your-admin-api-key>"
 ```
 
 ---
@@ -495,7 +497,7 @@ curl -X GET "http://localhost:8000/api/admin/stats" \
 const axios = require('axios');
 
 const API_BASE_URL = 'http://localhost:8000';
-const API_KEY = 'demo-user-key-67890';
+const API_KEY = '<your-user-api-key>';
 
 const headers = {
   'Authorization': `Bearer ${API_KEY}`,
@@ -559,11 +561,11 @@ curl http://localhost:8000/health
 
 # 2. List models
 curl -X GET "http://localhost:8000/api/models" \
-  -H "Authorization: Bearer demo-user-key-67890"
+  -H "Authorization: Bearer <your-user-api-key>"
 
 # 3. Generate text
 curl -X POST "http://localhost:8000/api/generate" \
-  -H "Authorization: Bearer demo-user-key-67890" \
+  -H "Authorization: Bearer <your-user-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama2",
@@ -573,7 +575,7 @@ curl -X POST "http://localhost:8000/api/generate" \
 
 # 4. Chat completion
 curl -X POST "http://localhost:8000/api/chat" \
-  -H "Authorization: Bearer demo-user-key-67890" \
+  -H "Authorization: Bearer <your-user-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama2",
@@ -584,11 +586,11 @@ curl -X POST "http://localhost:8000/api/chat" \
 
 # 5. Get your stats
 curl -X GET "http://localhost:8000/api/stats" \
-  -H "Authorization: Bearer demo-user-key-67890"
+  -H "Authorization: Bearer <your-user-api-key>"
 
 # Admin: Create API key
 curl -X POST "http://localhost:8000/api/keys" \
-  -H "Authorization: Bearer demo-admin-key-12345" \
+  -H "Authorization: Bearer <your-admin-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "New User Key",

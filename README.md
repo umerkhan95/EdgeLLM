@@ -83,20 +83,26 @@ Once the service is running, access the interactive documentation:
 
 ## Demo API Keys
 
-The service includes demo API keys for testing:
+The service supports demo API keys for testing (configured via environment variables):
 
 ### Admin Key
 ```
-API Key: 
+Set in .env file: DEMO_ADMIN_KEY=your-admin-key
 Role: admin
 Rate Limit: 1000 requests/hour
 ```
 
 ### User Key
 ```
-API Key: 
+Set in .env file: DEMO_USER_KEY=your-user-key
 Role: user
 Rate Limit: 100 requests/hour
+```
+
+**Generate secure keys:**
+```bash
+python3 -c "import secrets; print('DEMO_ADMIN_KEY=' + secrets.token_urlsafe(32))"
+python3 -c "import secrets; print('DEMO_USER_KEY=' + secrets.token_urlsafe(32))"
 ```
 
 ## API Usage Examples
@@ -113,14 +119,14 @@ Authorization: Bearer <your-api-key>
 
 ```bash
 curl -X GET "http://localhost:8000/api/models" \
-  -H "Authorization: Bearer demo-user-key-67890"
+  -H "Authorization: Bearer <your-api-key>"
 ```
 
 ### 2. Generate Text
 
 ```bash
 curl -X POST "http://localhost:8000/api/generate" \
-  -H "Authorization: Bearer demo-user-key-67890" \
+  -H "Authorization: Bearer <your-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama2",
@@ -134,7 +140,7 @@ curl -X POST "http://localhost:8000/api/generate" \
 
 ```bash
 curl -X POST "http://localhost:8000/api/chat" \
-  -H "Authorization: Bearer demo-user-key-67890" \
+  -H "Authorization: Bearer <your-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama2",
@@ -157,14 +163,14 @@ curl -X POST "http://localhost:8000/api/chat" \
 
 ```bash
 curl -X GET "http://localhost:8000/api/stats" \
-  -H "Authorization: Bearer demo-user-key-67890"
+  -H "Authorization: Bearer <your-api-key>"
 ```
 
 ### 5. Create New API Key (Admin Only)
 
 ```bash
 curl -X POST "http://localhost:8000/api/keys" \
-  -H "Authorization: Bearer demo-admin-key-12345" \
+  -H "Authorization: Bearer <your-admin-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Production API Key",
@@ -177,23 +183,24 @@ curl -X POST "http://localhost:8000/api/keys" \
 
 ```bash
 curl -X GET "http://localhost:8000/api/keys" \
-  -H "Authorization: Bearer demo-admin-key-12345"
+  -H "Authorization: Bearer <your-admin-key>"
 ```
 
 ### 7. Get All Usage Statistics (Admin Only)
 
 ```bash
 curl -X GET "http://localhost:8000/api/admin/stats" \
-  -H "Authorization: Bearer demo-admin-key-12345"
+  -H "Authorization: Bearer <your-admin-key>"
 ```
 
 ## Python Client Example
 
 ```python
 import requests
+import os
 
 API_BASE_URL = "http://localhost:8000"
-API_KEY = "demo-user-key-67890"
+API_KEY = os.getenv("DEMO_USER_KEY", "your-api-key-here")
 
 headers = {
     "Authorization": f"Bearer {API_KEY}",
