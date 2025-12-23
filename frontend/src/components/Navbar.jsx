@@ -19,11 +19,17 @@ const Navbar = () => {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between h-16">
           <div className="flex items-center">
-            <Link to="/" className="flex items-center space-x-2">
-              <Key className="h-8 w-8 text-primary-600 dark:text-primary-400" />
-              <span className="text-xl font-bold text-gray-900 dark:text-white">
-                Ollama API Gateway
-              </span>
+            <Link to="/" className="flex items-center space-x-3">
+              <img 
+                src="/assets/TPS-Logo.png" 
+                alt="TPS Logo" 
+                className="h-10 w-auto"
+              />
+              <div className="border-l border-gray-300 dark:border-gray-600 pl-3">
+                <span className="text-xl font-bold text-gray-900 dark:text-white">
+                  Ollama API Gateway
+                </span>
+              </div>
             </Link>
           </div>
 
