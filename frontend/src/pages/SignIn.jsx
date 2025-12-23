@@ -79,8 +79,8 @@ const SignIn = () => {
               <strong>Demo API Keys:</strong>
             </p>
             <div className="space-y-1 text-xs font-mono">
-              <p className="text-gray-700 dark:text-gray-300">Admin: demo-admin-key-12345</p>
-              <p className="text-gray-700 dark:text-gray-300">User: demo-user-key-67890</p>
+              <p className="text-gray-700 dark:text-gray-300">Admin: demo-admin-key-XXXX</p>
+              <p className="text-gray-700 dark:text-gray-300">User: demo-user-key-XXXX</p>
             </div>
           </div>
         </div>

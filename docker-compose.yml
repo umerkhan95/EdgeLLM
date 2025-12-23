@@ -41,6 +41,7 @@ services:
       - ollama-network
 
   frontend:
+    platform: linux/amd64
     build: ./frontend
     container_name: ollama-frontend
     ports:

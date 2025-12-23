@@ -7,6 +7,7 @@ import Home from './pages/Home';
 import SignIn from './pages/SignIn';
 import UserDashboard from './pages/UserDashboard';
 import AdminDashboard from './pages/AdminDashboard';
+import Playground from './pages/Playground';
 
 // Protected Route Component
 const ProtectedRoute = ({ children, requireAdmin = false }) => {
@@ -63,6 +64,14 @@ function AppContent() {
             element={
               <ProtectedRoute requireAdmin={true}>
                 <AdminDashboard />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/playground"
+            element={
+              <ProtectedRoute>
+                <Playground />
               </ProtectedRoute>
             }
           />

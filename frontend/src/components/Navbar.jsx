@@ -2,7 +2,7 @@ import React from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
-import { Sun, Moon, LogOut, Home, Key, BarChart } from 'lucide-react';
+import { Sun, Moon, LogOut, Home, Key, BarChart, MessageSquare } from 'lucide-react';
 
 const Navbar = () => {
   const { user, logout } = useAuth();
@@ -36,6 +36,13 @@ const Navbar = () => {
                 >
                   <BarChart className="h-5 w-5" />
                   <span>Dashboard</span>
+                </Link>
+                <Link
+                  to="/playground"
+                  className="flex items-center space-x-1 text-gray-700 dark:text-gray-200 hover:text-primary-600 dark:hover:text-primary-400"
+                >
+                  <MessageSquare className="h-5 w-5" />
+                  <span>Playground</span>
                 </Link>
                 <div className="text-sm text-gray-600 dark:text-gray-300">
                   <span className="font-medium">{user.name}</span>
