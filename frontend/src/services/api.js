@@ -62,6 +62,15 @@ export const apiService = {
     }
   },
 
+  revealApiKey: async (keyId) => {
+    try {
+      const response = await api.get(`/api/keys/${keyId}/reveal`);
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.detail || 'Failed to reveal API key' };
+    }
+  },
+
   revokeApiKey: async (keyId) => {
     try {
       const response = await api.delete(`/api/keys/${keyId}`);
@@ -87,6 +96,16 @@ export const apiService = {
       return { success: true, data: response.data };
     } catch (error) {
       return { success: false, error: error.response?.data?.detail || 'Failed to fetch detailed stats' };
+    }
+  },
+
+  // Admin: Get user statistics
+  getUserStats: async () => {
+    try {
+      const response = await api.get('/api/admin/stats/users');
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.detail || 'Failed to fetch user stats' };
     }
   },
 

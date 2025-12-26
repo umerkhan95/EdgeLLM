@@ -69,6 +69,7 @@ app = FastAPI(
     title="Ollama API Service",
     description="Secure API gateway for Ollama with authentication, authorization, and monitoring",
     version="1.0.0",
+    dopenapi_version="3.0.3",
     lifespan=lifespan
 )
 
@@ -371,6 +372,7 @@ async def list_api_keys(
     keys_list = []
     for key in api_keys:
         keys_list.append({
+            "id": key.id,
             "key_preview": f"{key.key[:20]}...",
             "name": key.name,
             "role": key.role,
@@ -380,6 +382,32 @@ async def list_api_keys(
         })
     
     return {"api_keys": keys_list, "total": len(keys_list)}
+
+@app.get("/api/keys/{key_id}/reveal", tags=["API Keys"])
+async def reveal_api_key(
+    key_id: int,
+    admin: APIKey = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Reveal full API key (admin only) - Use with caution"""
+    result = await db.execute(
+        select(APIKey).where(APIKey.id == key_id)
+    )
+    key = result.scalar_one_or_none()
+    
+    if not key:
+        raise HTTPException(status_code=404, detail="API key not found")
+    
+    logger.warning(f"Admin revealed API key: {key.name} (ID: {key_id})")
+    
+    return {
+        "id": key.id,
+        "name": key.name,
+        "key": key.key,
+        "role": key.role,
+        "rate_limit": key.rate_limit,
+        "created_at": key.created_at.isoformat()
+    }
 
 @app.delete("/api/keys/{key_preview}", tags=["API Keys"])
 async def revoke_api_key(
@@ -678,6 +706,140 @@ async def get_all_stats(
         }
     
     return {"statistics": all_stats}
+
+
+@app.get("/api/admin/stats/users", tags=["Monitoring"])
+async def get_user_stats(
+    admin: APIKey = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get detailed user statistics for admin dashboard (admin only)"""
+    from sqlalchemy import func as sql_func
+    
+    # Get all API keys
+    result = await db.execute(select(APIKey).where(APIKey.is_active == True))
+    api_keys = result.scalars().all()
+    
+    now = datetime.utcnow()
+    last_24h = now - timedelta(hours=24)
+    last_7d = now - timedelta(days=7)
+    last_hour = now - timedelta(hours=1)
+    
+    user_stats = []
+    
+    for key in api_keys:
+        # Get total requests
+        total_result = await db.execute(
+            select(sql_func.count(UsageLog.id)).where(UsageLog.api_key == key.key)
+        )
+        total_requests = total_result.scalar() or 0
+        
+        # Get 24h requests
+        requests_24h_result = await db.execute(
+            select(sql_func.count(UsageLog.id)).where(
+                and_(
+                    UsageLog.api_key == key.key,
+                    UsageLog.timestamp > last_24h
+                )
+            )
+        )
+        requests_24h = requests_24h_result.scalar() or 0
+        
+        # Get 7d requests
+        requests_7d_result = await db.execute(
+            select(sql_func.count(UsageLog.id)).where(
+                and_(
+                    UsageLog.api_key == key.key,
+                    UsageLog.timestamp > last_7d
+                )
+            )
+        )
+        requests_7d = requests_7d_result.scalar() or 0
+        
+        # Get hourly requests for rate limit
+        requests_hour_result = await db.execute(
+            select(sql_func.count(UsageLog.id)).where(
+                and_(
+                    UsageLog.api_key == key.key,
+                    UsageLog.timestamp > last_hour
+                )
+            )
+        )
+        requests_hour = requests_hour_result.scalar() or 0
+        
+        # Get average response time
+        avg_time_result = await db.execute(
+            select(sql_func.avg(UsageLog.response_time)).where(UsageLog.api_key == key.key)
+        )
+        avg_response_time = avg_time_result.scalar() or 0
+        
+        # Get last request time
+        last_request_result = await db.execute(
+            select(sql_func.max(UsageLog.timestamp)).where(UsageLog.api_key == key.key)
+        )
+        last_request = last_request_result.scalar()
+        
+        # Get requests by model for this user
+        model_stats = await db.execute(
+            select(
+                UsageLog.model,
+                sql_func.count(UsageLog.id).label('count')
+            ).where(
+                UsageLog.api_key == key.key
+            ).group_by(UsageLog.model)
+        )
+        requests_by_model = {row.model or "unknown": row.count for row in model_stats}
+        
+        # Get requests by endpoint for this user
+        endpoint_stats = await db.execute(
+            select(
+                UsageLog.endpoint,
+                sql_func.count(UsageLog.id).label('count')
+            ).where(
+                UsageLog.api_key == key.key
+            ).group_by(UsageLog.endpoint)
+        )
+        requests_by_endpoint = {row.endpoint or "unknown": row.count for row in endpoint_stats}
+        
+        rate_limit_usage = (requests_hour / key.rate_limit * 100) if key.rate_limit > 0 else 0
+        
+        user_stats.append({
+            "id": key.id,
+            "name": key.name,
+            "role": key.role,
+            "key_preview": f"{key.key[:20]}...",
+            "total_requests": total_requests,
+            "requests_24h": requests_24h,
+            "requests_7d": requests_7d,
+            "requests_this_hour": requests_hour,
+            "avg_response_time": round(avg_response_time, 3),
+            "rate_limit": key.rate_limit,
+            "rate_limit_usage": round(rate_limit_usage, 2),
+            "last_request": last_request.isoformat() if last_request else None,
+            "requests_by_model": requests_by_model,
+            "requests_by_endpoint": requests_by_endpoint,
+            "created_at": key.created_at.isoformat()
+        })
+    
+    # Sort by total requests (highest first)
+    user_stats.sort(key=lambda x: x['total_requests'], reverse=True)
+    
+    # Calculate global stats
+    total_requests_all = sum(u['total_requests'] for u in user_stats)
+    total_requests_24h_all = sum(u['requests_24h'] for u in user_stats)
+    total_requests_7d_all = sum(u['requests_7d'] for u in user_stats)
+    avg_response_time_all = sum(u['avg_response_time'] for u in user_stats) / len(user_stats) if user_stats else 0
+    
+    return {
+        "users": user_stats,
+        "summary": {
+            "total_users": len(user_stats),
+            "total_requests": total_requests_all,
+            "total_requests_24h": total_requests_24h_all,
+            "total_requests_7d": total_requests_7d_all,
+            "avg_response_time": round(avg_response_time_all, 3)
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
