@@ -352,6 +352,32 @@ struct FlatWeights(Movable):
         self.layer_ffn_sub_norm = other.layer_ffn_sub_norm^
 
 
+fn load_config(path: String) raises -> Config:
+    """Load config from T-MAC v2 file header."""
+    var f = open(path, "r")
+
+    var magic_bytes = f.read_bytes(4)
+    var magic = String("")
+    for i in range(3):
+        magic += chr(Int(magic_bytes[i]))
+    if magic != "TM2":
+        raise Error("Invalid model format: expected TM2")
+
+    # Read header: dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len
+    var header = f.read_bytes(7 * 4)
+    var header_ptr = header.unsafe_ptr().bitcast[Int32]()
+
+    return Config(
+        dim=Int(header_ptr[0]),
+        hidden_dim=Int(header_ptr[1]),
+        n_layers=Int(header_ptr[2]),
+        n_heads=Int(header_ptr[3]),
+        n_kv_heads=Int(header_ptr[4]),
+        vocab_size=Int(header_ptr[5]),
+        seq_len=Int(header_ptr[6])
+    )
+
+
 fn load_weights(path: String, config: Config) raises -> FlatWeights:
     """Load weights from T-MAC v2 format."""
     var weights = FlatWeights()
@@ -365,6 +391,7 @@ fn load_weights(path: String, config: Config) raises -> FlatWeights:
     if magic != "TM2":
         raise Error("Invalid model format")
 
+    # Skip header (already read by load_config)
     _ = f.read_bytes(7 * 4)
 
     fn read_ternary_matrix(mut file: FileHandle, mut w: FlatWeights) raises -> Tuple[Int, Int, Int, Int]:
@@ -756,18 +783,12 @@ fn main() raises:
     print("=" * 50)
     print("Loading model from", model_path)
 
-    var config = Config(
-        dim=2560,
-        hidden_dim=6912,
-        n_layers=30,
-        n_heads=20,
-        n_kv_heads=5,
-        vocab_size=128256,
-        seq_len=4096
-    )
+    # Load config from file header
+    var config = load_config(model_path)
 
     print("Config: dim=", config.dim, "hidden=", config.hidden_dim, "layers=", config.n_layers)
     print("        heads=", config.n_heads, "kv_heads=", config.n_kv_heads)
+    print("        vocab_size=", config.vocab_size, "seq_len=", config.seq_len)
 
     var weights = load_weights(model_path, config)
     var state = RunState(config)
@@ -780,7 +801,8 @@ fn main() raises:
     print("Temperature:", temperature, "Top-p:", topp)
     print("-" * 50)
 
-    var token = 128000
+    # Use BOS token (typically 0 or 1, clamped to vocab size for safety)
+    var token = 1 if config.vocab_size > 1 else 0
     var start_time = time.perf_counter_ns()
     var tokens_generated = 0
 
