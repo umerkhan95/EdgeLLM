@@ -1086,4 +1086,328 @@ int fused_rmsnorm_matmul_cuda_fast(
     return 0;
 }
 
+// ============================================================================
+// Phase 2.1: Optimized Kernels (No Atomics, True Fusion)
+// ============================================================================
+
+/**
+ * Optimized T-MAC kernel with warp-private accumulation (NO atomicAdd)
+ *
+ * Key optimizations:
+ * 1. Each thread accumulates its own partial sum (no atomics)
+ * 2. Warp-level reduction using shuffle
+ * 3. Direct accumulation without LUT (simpler for batch_size=1)
+ * 4. Better memory coalescing
+ */
+__global__ void tmac_matmul_kernel_v3(
+    const int8_t* __restrict__ packed_weights,  // Packed ternary weights
+    const float* __restrict__ activations,       // Input activations [K * N]
+    float* __restrict__ output,                  // Output buffer [M * N]
+    const float* __restrict__ scales,            // Per-row scales [M]
+    int M,                                       // Output rows
+    int N,                                       // Output cols (batch)
+    int K                                        // Inner dimension
+) {
+    // Each block handles one output row, threads process K in parallel
+    int row = blockIdx.x;
+    int col = blockIdx.y;  // For batch_size=1, col=0
+    int tid = threadIdx.x;
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+
+    if (row >= M || col >= N) return;
+
+    // Each thread accumulates its own partial sum
+    float partial_sum = 0.0f;
+    float scale = scales[row];
+    int weight_row_bytes = (K + 3) / 4;
+
+    // Process K dimension - each thread handles strided elements
+    for (int k = tid; k < K; k += BLOCK_SIZE) {
+        // Load activation (coalesced across threads)
+        float act = activations[k * N + col];
+
+        // Load and unpack weight
+        int byte_idx = k / 4;
+        int bit_offset = (k % 4) * 2;
+        int8_t packed = packed_weights[row * weight_row_bytes + byte_idx];
+        int ternary = ((packed >> bit_offset) & 0x3) - 1;  // -1, 0, +1
+
+        // Accumulate (no atomic needed - thread-private)
+        partial_sum += ternary * act;
+    }
+
+    // Warp-level reduction using shuffle (fast!)
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        partial_sum += __shfl_down_sync(0xffffffff, partial_sum, offset);
+    }
+
+    // Write warp result to shared memory
+    __shared__ float warp_sums[8];  // Max 8 warps per block
+    if (lane == 0) {
+        warp_sums[warp_id] = partial_sum;
+    }
+    __syncthreads();
+
+    // Final reduction across warps (only first warp)
+    if (warp_id == 0 && tid < (BLOCK_SIZE / WARP_SIZE)) {
+        partial_sum = warp_sums[tid];
+
+        #pragma unroll
+        for (int offset = (BLOCK_SIZE / WARP_SIZE) / 2; offset > 0; offset /= 2) {
+            partial_sum += __shfl_down_sync(0xffffffff, partial_sum, offset);
+        }
+
+        if (tid == 0) {
+            output[row * N + col] = partial_sum * scale;
+        }
+    }
+}
+
+/**
+ * True Streaming Fused RMSNorm + T-MAC MatMul Kernel
+ *
+ * Key insight: For batch_size=1, we don't need LUT at all!
+ * Just compute: output[row] = scale[row] * sum_k(ternary[row,k] * normalized[k])
+ *
+ * Two-pass algorithm:
+ * Pass 1: Compute RMS = sqrt(mean(x^2) + eps)
+ * Pass 2: Stream through K, normalize on-the-fly, accumulate with ternary weights
+ */
+__global__ void streaming_fused_rmsnorm_matmul_kernel(
+    const float* __restrict__ input,            // Input [K]
+    const float* __restrict__ norm_weights,     // RMSNorm weights [K]
+    const int8_t* __restrict__ matmul_weights,  // Packed ternary [M * K/4]
+    const float* __restrict__ matmul_scales,    // Per-row scales [M]
+    float* __restrict__ output,                 // Output [M]
+    int K,                                      // Hidden size
+    int M,                                      // Output dimension
+    float eps
+) {
+    // Shared memory for RMS computation
+    __shared__ float smem[BLOCK_SIZE];
+    __shared__ float s_rms;
+
+    int row = blockIdx.x;  // Output row
+    int tid = threadIdx.x;
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+
+    if (row >= M) return;
+
+    // =========== Pass 1: Compute RMS (all threads collaborate) ===========
+    float sum_sq = 0.0f;
+    for (int k = tid; k < K; k += BLOCK_SIZE) {
+        float val = input[k];
+        sum_sq += val * val;
+    }
+
+    // Reduce within block
+    smem[tid] = sum_sq;
+    __syncthreads();
+
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        s_rms = rsqrtf(smem[0] / K + eps);
+    }
+    __syncthreads();
+
+    float rms = s_rms;
+
+    // =========== Pass 2: Streaming normalize + matmul ===========
+    // Each thread accumulates its partial sum
+    float partial_sum = 0.0f;
+    float scale = matmul_scales[row];
+    int weight_row_bytes = (K + 3) / 4;
+
+    for (int k = tid; k < K; k += BLOCK_SIZE) {
+        // Load and normalize on-the-fly (no intermediate storage!)
+        float val = input[k];
+        float normalized = val * rms * norm_weights[k];
+
+        // Load ternary weight
+        int byte_idx = k / 4;
+        int bit_offset = (k % 4) * 2;
+        int8_t packed = matmul_weights[row * weight_row_bytes + byte_idx];
+        int ternary = ((packed >> bit_offset) & 0x3) - 1;
+
+        // Accumulate directly
+        partial_sum += ternary * normalized;
+    }
+
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        partial_sum += __shfl_down_sync(0xffffffff, partial_sum, offset);
+    }
+
+    // Write warp results to shared memory (reuse smem)
+    if (lane == 0) {
+        smem[warp_id] = partial_sum;
+    }
+    __syncthreads();
+
+    // Final reduction
+    if (warp_id == 0 && tid < (BLOCK_SIZE / WARP_SIZE)) {
+        partial_sum = smem[tid];
+
+        #pragma unroll
+        for (int offset = (BLOCK_SIZE / WARP_SIZE) / 2; offset > 0; offset /= 2) {
+            partial_sum += __shfl_down_sync(0xffffffff, partial_sum, offset);
+        }
+
+        if (tid == 0) {
+            output[row] = partial_sum * scale;
+        }
+    }
+}
+
+// Dispatch threshold constants
+#define DISPATCH_THRESHOLD_FUSED 500000  // M*K > 500K: use fused
+#define DISPATCH_THRESHOLD_V3    50000   // M*K > 50K: use v3 kernel
+
+/**
+ * Optimized T-MAC MatMul with adaptive dispatch
+ *
+ * Chooses the best kernel based on tensor size:
+ * - Large tensors: streaming fused kernel
+ * - Medium tensors: v3 kernel (warp-private)
+ * - Small tensors: simple persistent kernel (avoid overhead)
+ */
+int tmac_matmul_cuda_v3(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+) {
+    if (!cuda_initialized || !weights_on_gpu) return -1;
+
+    int act_size = K * N;
+    int out_size = M * N;
+
+    // Transfer activations
+    CUDA_CHECK(cudaMemcpy(d_activations, activations, act_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch optimized kernel
+    dim3 grid(M, N);  // One block per (row, col) for batch_size=1
+    dim3 block(BLOCK_SIZE);
+
+    tmac_matmul_kernel_v3<<<grid, block>>>(
+        d_persistent_weights,
+        d_activations,
+        d_output,
+        d_persistent_scales,
+        M, N, K
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+
+    // Transfer output
+    CUDA_CHECK(cudaMemcpy(output, d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost));
+
+    return 0;
+}
+
+/**
+ * Streaming Fused RMSNorm + T-MAC MatMul
+ *
+ * True fusion: normalizes on-the-fly without intermediate storage.
+ * Best for batch_size=1 (single token generation).
+ */
+int streaming_fused_rmsnorm_matmul_cuda(
+    const float* input,
+    float* output,
+    int M,      // Output dimension
+    int K,      // Hidden size
+    float eps
+) {
+    if (!cuda_initialized || !weights_on_gpu || !norm_weights_on_gpu) return -1;
+
+    // Transfer input
+    CUDA_CHECK(cudaMemcpy(d_activations, input, K * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch streaming fused kernel
+    dim3 grid(M);
+    dim3 block(BLOCK_SIZE);
+
+    streaming_fused_rmsnorm_matmul_kernel<<<grid, block>>>(
+        d_activations,
+        d_persistent_norm_weights,
+        d_persistent_weights,
+        d_persistent_scales,
+        d_output,
+        K, M, eps
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+
+    // Transfer output
+    CUDA_CHECK(cudaMemcpy(output, d_output, M * sizeof(float), cudaMemcpyDeviceToHost));
+
+    return 0;
+}
+
+/**
+ * Adaptive dispatch: automatically choose best kernel
+ */
+int tmac_matmul_cuda_adaptive(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+) {
+    if (!cuda_initialized || !weights_on_gpu) return -1;
+
+    int elements = M * K;
+
+    if (elements > DISPATCH_THRESHOLD_V3) {
+        // Large/medium tensors: use optimized v3 kernel
+        return tmac_matmul_cuda_v3(activations, output, M, N, K);
+    } else {
+        // Small tensors: use simple persistent kernel (less overhead)
+        return tmac_matmul_cuda_persistent(activations, output, M, N, K);
+    }
+}
+
+/**
+ * Adaptive fused: choose between streaming fused and separate kernels
+ */
+int fused_rmsnorm_matmul_cuda_adaptive(
+    const float* input,
+    float* output,
+    int M, int N, int K,
+    float eps
+) {
+    if (!cuda_initialized || !weights_on_gpu || !norm_weights_on_gpu) return -1;
+
+    int elements = M * K;
+
+    if (N == 1 && elements > DISPATCH_THRESHOLD_V3) {
+        // Batch size 1 + large tensor: use streaming fused
+        return streaming_fused_rmsnorm_matmul_cuda(input, output, M, K, eps);
+    } else {
+        // Fall back to separate kernels for small tensors or batched
+        // (The overhead of fusion doesn't pay off)
+        float* norm_out = (float*)malloc(K * sizeof(float));
+        if (!norm_out) return -1;
+
+        // RMSNorm
+        int ret = rmsnorm_cuda_persistent(norm_out, input, 1, K, eps);
+        if (ret != 0) {
+            free(norm_out);
+            return ret;
+        }
+
+        // MatMul
+        ret = tmac_matmul_cuda_adaptive(norm_out, output, M, N, K);
+        free(norm_out);
+        return ret;
+    }
+}
+
 } // extern "C"

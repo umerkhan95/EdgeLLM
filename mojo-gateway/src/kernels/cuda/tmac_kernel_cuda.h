@@ -328,6 +328,97 @@ int fused_rmsnorm_matmul_cuda_fast(
     float eps
 );
 
+// ============================================================================
+// Phase 2.1: Optimized Kernels (No Atomics, True Fusion)
+// ============================================================================
+
+/**
+ * Optimized T-MAC MatMul with warp-private accumulation (Phase 2.1)
+ *
+ * Key optimizations:
+ * - No atomicAdd (each thread accumulates privately)
+ * - Warp-level shuffle reduction (fast!)
+ * - Direct accumulation without LUT (simpler for batch_size=1)
+ *
+ * @param activations Input activations (host memory) [K * N]
+ * @param output      Output buffer (host memory) [M * N]
+ * @param M           Number of output rows
+ * @param N           Number of output columns (batch size)
+ * @param K           Inner dimension
+ * @return 0 on success, -1 on failure
+ */
+int tmac_matmul_cuda_v3(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+);
+
+/**
+ * Streaming Fused RMSNorm + T-MAC MatMul (Phase 2.1)
+ *
+ * True fusion: normalizes on-the-fly without intermediate storage.
+ * Two-pass algorithm:
+ *   Pass 1: Compute RMS = sqrt(mean(x^2) + eps)
+ *   Pass 2: Stream through K, normalize on-the-fly, accumulate
+ *
+ * Best for batch_size=1 (single token generation).
+ *
+ * @param input     Input activations (host memory) [K]
+ * @param output    Output buffer (host memory) [M]
+ * @param M         Output dimension
+ * @param K         Hidden size / input dimension
+ * @param eps       Epsilon for RMSNorm numerical stability
+ * @return 0 on success, -1 on failure
+ */
+int streaming_fused_rmsnorm_matmul_cuda(
+    const float* input,
+    float* output,
+    int M, int K,
+    float eps
+);
+
+/**
+ * Adaptive T-MAC MatMul dispatch (Phase 2.1)
+ *
+ * Automatically chooses optimal kernel based on tensor size:
+ * - Large tensors (M*K > 50K): v3 kernel (warp-private accumulation)
+ * - Small tensors: persistent kernel (avoids overhead)
+ *
+ * @param activations Input activations (host memory) [K * N]
+ * @param output      Output buffer (host memory) [M * N]
+ * @param M           Number of output rows
+ * @param N           Number of output columns (batch size)
+ * @param K           Inner dimension
+ * @return 0 on success, -1 on failure
+ */
+int tmac_matmul_cuda_adaptive(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+);
+
+/**
+ * Adaptive Fused RMSNorm + MatMul dispatch (Phase 2.1)
+ *
+ * Automatically chooses optimal kernel based on tensor size and batch:
+ * - Batch=1 + large tensors: streaming fused kernel (best performance)
+ * - Otherwise: separate RMSNorm + MatMul (avoids fusion overhead)
+ *
+ * @param input     Input activations (host memory) [K * N]
+ * @param output    Output buffer (host memory) [M * N]
+ * @param M         Number of output rows
+ * @param N         Number of output columns (batch size)
+ * @param K         Hidden size / input dimension
+ * @param eps       Epsilon for RMSNorm numerical stability
+ * @return 0 on success, -1 on failure
+ */
+int fused_rmsnorm_matmul_cuda_adaptive(
+    const float* input,
+    float* output,
+    int M, int N, int K,
+    float eps
+);
+
 #ifdef __cplusplus
 }
 #endif
