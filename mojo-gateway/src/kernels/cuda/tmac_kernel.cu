@@ -1418,13 +1418,20 @@ int fused_rmsnorm_matmul_cuda_adaptive(
 // NOTE: This section is OUTSIDE extern "C" because WMMA uses C++ templates.
 // The C-callable API wrappers are defined later in a new extern "C" block.
 
-// Check for Tensor Core support (compile-time)
-#if __CUDA_ARCH__ >= 750
+// Include WMMA header for Tensor Core support
+// Note: We include unconditionally for host compilation, but use __CUDA_ARCH__
+// guards for device-specific intrinsics inside kernels
+#if defined(__CUDACC__)
 #include <mma.h>
 using namespace nvcuda::wmma;
-#define HAS_WMMA 1
+#endif
+
+// Runtime check for WMMA support (used in host code)
+// __CUDA_ARCH__ is only defined during device compilation
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#define HAS_WMMA_DEVICE 1
 #else
-#define HAS_WMMA 0
+#define HAS_WMMA_DEVICE 0
 #endif
 
 // WMMA tile dimensions for INT8
@@ -1562,7 +1569,9 @@ __global__ void dequantize_output_kernel(
     }
 }
 
-#if HAS_WMMA
+// The kernel is always compiled when __CUDACC__ is defined (since mma.h is included)
+// Runtime compute capability check is done in the host API before launching
+#if defined(__CUDACC__)
 /**
  * INT8 Tensor Core Matrix Multiplication Kernel
  *
@@ -1657,7 +1666,7 @@ __global__ void int8_tensorcore_matmul_kernel(
         store_matrix_sync(&output_int32[out_row * N + out_col], frag_C, N, mem_row_major);
     }
 }
-#endif // HAS_WMMA
+#endif // __CUDACC__
 
 /**
  * Fallback INT8 matmul kernel for devices without WMMA support
@@ -1898,7 +1907,7 @@ int tmac_matmul_cuda_int8_tc(
     // Step 3: INT8 Matrix Multiplication
     int cc = cuda_get_compute_capability();
 
-#if HAS_WMMA
+    // Runtime check for Tensor Core support (>= sm_75)
     if (cc >= TC_MIN_COMPUTE_CAP) {
         // Use Tensor Core kernel
         dim3 grid((M + TC_BLOCK_M - 1) / TC_BLOCK_M, (N + TC_BLOCK_N - 1) / TC_BLOCK_N);
@@ -1910,10 +1919,8 @@ int tmac_matmul_cuda_int8_tc(
             d_output_int32,
             M, N, K
         );
-    } else
-#endif
-    {
-        // Use fallback kernel
+    } else {
+        // Use fallback kernel for older GPUs
         dim3 grid(M, N);
         dim3 block(BLOCK_SIZE);
 
