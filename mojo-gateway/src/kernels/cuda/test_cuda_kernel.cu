@@ -36,7 +36,7 @@ int test_cuda_init() {
         return 0;
     }
 
-    int ret = cuda_init(1000000, 100000, 100000);
+    int ret = cuda_init_sized(1000000, 100000, 100000);
     TEST_ASSERT(ret == 0, "CUDA initialization");
     TEST_PASS("CUDA initialization");
 
@@ -73,7 +73,7 @@ int test_rmsnorm() {
         return 0;
     }
 
-    int ret = cuda_init(1000000, 100000, 100000);
+    int ret = cuda_init_sized(1000000, 100000, 100000);
     if (ret != 0) {
         printf("SKIP: CUDA init failed\n");
         return 0;
@@ -118,7 +118,7 @@ int test_softmax() {
         return 0;
     }
 
-    int ret = cuda_init(1000000, 100000, 100000);
+    int ret = cuda_init_sized(1000000, 100000, 100000);
     if (ret != 0) {
         printf("SKIP: CUDA init failed\n");
         return 0;

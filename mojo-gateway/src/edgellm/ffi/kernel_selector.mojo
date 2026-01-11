@@ -106,7 +106,8 @@ fn select_backend(
 
     # Try CUDA first if preferred
     if prefer_gpu and cuda_available():
-        if cuda_init(max_weights_bytes, max_activations, max_output):
+        # Use no-arg init - buffers dynamically resize as needed
+        if cuda_init():
             _selected_backend = KernelBackend.CUDA
             _backend_initialized = True
             return _selected_backend

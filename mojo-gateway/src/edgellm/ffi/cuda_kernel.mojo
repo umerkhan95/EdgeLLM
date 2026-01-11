@@ -66,18 +66,12 @@ fn cuda_available() -> Bool:
     return _cuda_available
 
 
-fn cuda_init(
-    max_weights_bytes: Int,
-    max_activations: Int,
-    max_output: Int,
-) raises -> Bool:
+fn cuda_init() raises -> Bool:
     """
-    Initialize CUDA context and allocate device memory.
+    Initialize CUDA context with default buffer sizes.
 
-    Args:
-        max_weights_bytes: Maximum size of weight buffer in bytes
-        max_activations: Maximum number of activation elements
-        max_output: Maximum number of output elements
+    Uses sensible defaults for models up to 7B parameters.
+    Buffers are dynamically resized as needed.
 
     Returns:
         True on success, False on failure.
@@ -86,7 +80,31 @@ fn cuda_init(
         return False
 
     var kernel = get_cuda_kernel()
-    var result = kernel.call["cuda_init", Int](
+    var result = kernel.call["cuda_init", Int]()
+    return result == 0
+
+
+fn cuda_init_sized(
+    max_weights_bytes: Int,
+    max_activations: Int,
+    max_output: Int,
+) raises -> Bool:
+    """
+    Initialize CUDA context with explicit buffer sizes.
+
+    Args:
+        max_weights_bytes: Initial size of weight buffer in bytes
+        max_activations: Initial number of activation elements
+        max_output: Initial number of output elements
+
+    Returns:
+        True on success, False on failure.
+    """
+    if not cuda_available():
+        return False
+
+    var kernel = get_cuda_kernel()
+    var result = kernel.call["cuda_init_sized", Int](
         max_weights_bytes, max_activations, max_output
     )
     return result == 0

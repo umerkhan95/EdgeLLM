@@ -27,9 +27,8 @@ fn try_init_cuda() -> Bool:
     try:
         from src.edgellm.ffi.cuda_kernel import cuda_available, cuda_init, print_cuda_info
         if cuda_available():
-            # Initialize with reasonable buffer sizes for SmolLM-135M
-            # max_weights: ~53MB, max_activations: 4096, max_output: 50000
-            var success = cuda_init(60 * 1024 * 1024, 4096, 50000)
+            # Initialize CUDA with default buffers (dynamically resized as needed)
+            var success = cuda_init()
             if success:
                 print_cuda_info()
                 return True

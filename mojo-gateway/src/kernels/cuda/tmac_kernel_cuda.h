@@ -18,16 +18,29 @@ extern "C" {
 #endif
 
 /**
- * Initialize CUDA context and allocate device memory.
+ * Initialize CUDA context with default buffer sizes.
+ *
+ * Uses sensible defaults suitable for models up to 7B parameters.
+ * Buffers are dynamically resized as needed during matmul operations.
  *
  * Must be called before any CUDA operations.
  *
- * @param max_weights_bytes   Maximum size of weight buffer in bytes
- * @param max_activations     Maximum number of activation elements
- * @param max_output          Maximum number of output elements
  * @return 0 on success, -1 on failure
  */
-int cuda_init(int max_weights_bytes, int max_activations, int max_output);
+int cuda_init(void);
+
+/**
+ * Initialize CUDA context with explicit buffer sizes.
+ *
+ * Allows specifying initial buffer sizes for memory optimization.
+ * Buffers are still dynamically resized if operations require more space.
+ *
+ * @param max_weights_bytes   Initial size of weight buffer in bytes
+ * @param max_activations     Initial number of activation elements
+ * @param max_output          Initial number of output elements
+ * @return 0 on success, -1 on failure
+ */
+int cuda_init_sized(int max_weights_bytes, int max_activations, int max_output);
 
 /**
  * Cleanup CUDA resources.

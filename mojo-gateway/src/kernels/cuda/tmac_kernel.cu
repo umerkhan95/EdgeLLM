@@ -331,11 +331,61 @@ static float* d_output = nullptr;
 static float* d_scales = nullptr;
 static int cuda_initialized = 0;
 
+// Track allocated buffer sizes for dynamic reallocation
+static size_t allocated_activations_size = 0;
+static size_t allocated_output_size = 0;
+
+// Default sizes for SmolLM-135M (can handle up to 7B models)
+#define DEFAULT_MAX_DIM 4096
+#define DEFAULT_MAX_WEIGHTS_BYTES (DEFAULT_MAX_DIM * DEFAULT_MAX_DIM / 4)  // 2-bit packed
+#define DEFAULT_MAX_ACTIVATIONS DEFAULT_MAX_DIM
+#define DEFAULT_MAX_OUTPUT DEFAULT_MAX_DIM
+
 /**
- * Initialize CUDA context and allocate device memory
+ * Initialize CUDA context (no-argument version with sensible defaults)
  */
-int cuda_init(int max_weights_bytes, int max_activations, int max_output) {
+int cuda_init() {
     if (cuda_initialized) return 0;
+
+    // Check for CUDA devices
+    int device_count;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    if (device_count == 0) {
+        fprintf(stderr, "No CUDA devices found\n");
+        return -1;
+    }
+
+    // Print device info
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    printf("EdgeLLM CUDA Engine initialized on: %s\n", prop.name);
+    printf("  - Compute capability: %d.%d\n", prop.major, prop.minor);
+    printf("  - Total memory: %.2f GB\n", prop.totalGlobalMem / 1e9);
+    printf("  - SM count: %d\n", prop.multiProcessorCount);
+
+    // Allocate device memory with sensible defaults
+    CUDA_CHECK(cudaMalloc(&d_weights, DEFAULT_MAX_WEIGHTS_BYTES));
+    CUDA_CHECK(cudaMalloc(&d_activations, DEFAULT_MAX_ACTIVATIONS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, DEFAULT_MAX_OUTPUT * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_scales, DEFAULT_MAX_OUTPUT * sizeof(float)));
+
+    allocated_activations_size = DEFAULT_MAX_ACTIVATIONS;
+    allocated_output_size = DEFAULT_MAX_OUTPUT;
+
+    cuda_initialized = 1;
+    return 0;
+}
+
+/**
+ * Initialize CUDA context and allocate device memory (with explicit sizes)
+ */
+int cuda_init_sized(int max_weights_bytes, int max_activations, int max_output) {
+    if (cuda_initialized) return 0;
+
+    // Validate parameters - use defaults if invalid
+    if (max_weights_bytes <= 0) max_weights_bytes = DEFAULT_MAX_WEIGHTS_BYTES;
+    if (max_activations <= 0) max_activations = DEFAULT_MAX_ACTIVATIONS;
+    if (max_output <= 0) max_output = DEFAULT_MAX_OUTPUT;
 
     // Check for CUDA devices
     int device_count;
@@ -359,6 +409,9 @@ int cuda_init(int max_weights_bytes, int max_activations, int max_output) {
     CUDA_CHECK(cudaMalloc(&d_output, max_output * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_scales, max_output * sizeof(float)));
 
+    allocated_activations_size = max_activations;
+    allocated_output_size = max_output;
+
     cuda_initialized = 1;
     return 0;
 }
@@ -378,6 +431,10 @@ void cuda_cleanup() {
     d_activations = nullptr;
     d_output = nullptr;
     d_scales = nullptr;
+
+    // Reset allocated sizes
+    allocated_activations_size = 0;
+    allocated_output_size = 0;
 
     cuda_initialized = 0;
 }
@@ -640,8 +697,26 @@ int tmac_matmul_cuda_persistent(
     }
 
     // Calculate sizes
-    int act_size = K * N;
-    int out_size = M * N;
+    size_t act_size = (size_t)K * N;
+    size_t out_size = (size_t)M * N;
+
+    // Dynamically resize activation buffer if needed
+    if (act_size > allocated_activations_size) {
+        if (d_activations) {
+            cudaFree(d_activations);
+        }
+        CUDA_CHECK(cudaMalloc(&d_activations, act_size * sizeof(float)));
+        allocated_activations_size = act_size;
+    }
+
+    // Dynamically resize output buffer if needed
+    if (out_size > allocated_output_size) {
+        if (d_output) {
+            cudaFree(d_output);
+        }
+        CUDA_CHECK(cudaMalloc(&d_output, out_size * sizeof(float)));
+        allocated_output_size = out_size;
+    }
 
     // Transfer ONLY activations to device (weights already there!)
     CUDA_CHECK(cudaMemcpy(d_activations, activations, act_size * sizeof(float), cudaMemcpyHostToDevice));
