@@ -1,5 +1,8 @@
-# T-MAC Kernel Build System
-# Builds shared libraries for x86 (AVX2) and ARM (NEON)
+# EdgeLLM Kernel Build System
+# Builds shared libraries for:
+# - x86 (AVX2)
+# - ARM (NEON)
+# - NVIDIA GPU (CUDA)
 
 CC = clang
 CFLAGS_COMMON = -O3 -fPIC -Wall -Wextra
@@ -103,3 +106,36 @@ info:
 	@echo "Compiler: $(CC)"
 	@echo "CFLAGS: $(CFLAGS)"
 	@echo "Target: $(TARGET)"
+
+# ============================================================================
+# CUDA Targets
+# ============================================================================
+
+.PHONY: cuda cuda-clean cuda-test cuda-jetson cuda-rtx
+
+# Build CUDA kernels
+cuda:
+	@echo "Building CUDA kernels..."
+	$(MAKE) -C cuda all
+
+# Clean CUDA build
+cuda-clean:
+	$(MAKE) -C cuda clean
+
+# Test CUDA kernels
+cuda-test:
+	$(MAKE) -C cuda test
+
+# Jetson Nano build
+cuda-jetson:
+	$(MAKE) -C cuda jetson-nano
+
+# RTX build
+cuda-rtx:
+	$(MAKE) -C cuda rtx
+
+# Build all (CPU + GPU)
+all-gpu: all cuda
+
+# Clean all (CPU + GPU)
+clean-all: clean cuda-clean
