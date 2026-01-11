@@ -1569,9 +1569,9 @@ __global__ void dequantize_output_kernel(
     }
 }
 
-// The kernel is always compiled when __CUDACC__ is defined (since mma.h is included)
+// INT8 Tensor Core kernel - requires mma.h which is included above under __CUDACC__
 // Runtime compute capability check is done in the host API before launching
-#if defined(__CUDACC__)
+
 /**
  * INT8 Tensor Core Matrix Multiplication Kernel
  *
@@ -1666,7 +1666,6 @@ __global__ void int8_tensorcore_matmul_kernel(
         store_matrix_sync(&output_int32[out_row * N + out_col], frag_C, N, mem_row_major);
     }
 }
-#endif // __CUDACC__
 
 /**
  * Fallback INT8 matmul kernel for devices without WMMA support
