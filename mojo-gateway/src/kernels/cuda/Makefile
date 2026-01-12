@@ -125,8 +125,14 @@ test-int8: dirs flash_attention_int8.o
 	@echo "Running INT8 Flash Attention tests..."
 	$(BIN_DIR)/test_flash_attention_int8
 
+# FlashAttention-2 accuracy test
+test-fa2-accuracy: dirs flash_attention_v2.o
+	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/test_flash_attention_v2_accuracy test_flash_attention_v2_accuracy.cu flash_attention_v2.o -lcudart
+	@echo "Running FlashAttention-2 accuracy tests..."
+	$(BIN_DIR)/test_flash_attention_v2_accuracy
+
 # Test all
-test-all: test test-flash test-int8
+test-all: test test-flash test-int8 test-fa2-accuracy
 
 # Clean
 clean:
