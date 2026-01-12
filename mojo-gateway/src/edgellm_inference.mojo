@@ -246,21 +246,9 @@ struct TransformerWeights:
             config.seq_len, config.head_size // 2
         )
 
-        # Check for shared weights
+        # Initialize wcls - will be empty if weights are shared
         self.shared_weights = True
-        try:
-            var remaining = f.read_bytes(4)
-            if len(remaining) >= 4:
-                self.shared_weights = False
-                self.wcls = Matrix(
-                    read_weights(f, config.vocab_size * config.dim),
-                    config.vocab_size, config.dim
-                )
-        except:
-            pass
-
-        if self.shared_weights:
-            self.wcls = Matrix(List[Float32](), 0, 0)
+        self.wcls = Matrix(List[Float32](), 0, 0)
 
         f.close()
         print("Loaded", config.dim * config.n_layers // 1000, "K parameters")
