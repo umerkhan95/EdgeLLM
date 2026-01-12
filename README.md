@@ -85,6 +85,48 @@ edgellm serve smollm-135m --port 8080
 
 ---
 
+## CUDA Kernel Status
+
+Complete GPU inference pipeline for LLaMA-style transformers.
+
+| Kernel | Status | Features |
+|--------|--------|----------|
+| **Attention (INT8)** | ✅ Complete | `__dp4a` Flash Attention, 2.5x faster than Ollama |
+| **RMSNorm** | ✅ Complete | Warp reductions, vectorized, fused residual |
+| **FFN/MLP** | ✅ Complete | SwiGLU activation, tiled, INT8 quantized |
+| **Embeddings** | ✅ Complete | Token lookup, RoPE positional encoding |
+| **Sampling** | ✅ Complete | Temperature, Top-K, Top-P, greedy |
+
+### Build CUDA Kernels
+
+```bash
+cd mojo-gateway/src/kernels/cuda
+
+# Build unified inference library (recommended)
+make inference-unified
+
+# Or build individual kernels
+make rmsnorm ffn embeddings sampling int8
+
+# Platform-specific builds
+make t4          # Tesla T4 (Kaggle/Colab)
+make jetson-nano # Jetson Nano
+make rtx         # RTX 30/40 series
+```
+
+### Kernel Files
+
+| File | Purpose |
+|------|---------|
+| `flash_attention_int8.cu` | INT8 dp4a attention (2.5x faster) |
+| `rmsnorm_kernel.cu` | RMS Layer Normalization |
+| `ffn_kernel.cu` | Feed-Forward Network (SwiGLU) |
+| `embeddings_kernel.cu` | Token embeddings + RoPE |
+| `sampling_kernel.cu` | Sampling strategies |
+| `inference_kernels.h` | Unified header |
+
+---
+
 ## Architecture
 
 ```

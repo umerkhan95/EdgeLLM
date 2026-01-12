@@ -39,9 +39,22 @@ FA_TARGET = $(LIB_DIR)/libflash_attention.$(SHARED_EXT)
 INT8_TARGET = $(LIB_DIR)/libflash_attention_int8.$(SHARED_EXT)
 FA2_TARGET = $(LIB_DIR)/libflash_attention_v2.$(SHARED_EXT)
 
+# New inference pipeline targets
+RMSNORM_TARGET = $(LIB_DIR)/librmsnorm_kernel.$(SHARED_EXT)
+FFN_TARGET = $(LIB_DIR)/libffn_kernel.$(SHARED_EXT)
+EMBEDDINGS_TARGET = $(LIB_DIR)/libembeddings_kernel.$(SHARED_EXT)
+SAMPLING_TARGET = $(LIB_DIR)/libsampling_kernel.$(SHARED_EXT)
+INFERENCE_TARGET = $(LIB_DIR)/libedgellm_inference.$(SHARED_EXT)
+
 SOURCES = tmac_kernel.cu flash_attention.cu
 OBJECTS = tmac_kernel.o flash_attention.o
-HEADERS = tmac_kernel_cuda.h flash_attention.h flash_attention_int8.h
+HEADERS = tmac_kernel_cuda.h flash_attention.h flash_attention_int8.h inference_kernels.h
+
+# New inference kernel objects
+RMSNORM_OBJ = rmsnorm_kernel.o
+FFN_OBJ = ffn_kernel.o
+EMBEDDINGS_OBJ = embeddings_kernel.o
+SAMPLING_OBJ = sampling_kernel.o
 
 .PHONY: all clean test install dirs check info
 
@@ -151,6 +164,72 @@ all-attention: dirs $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_OPT_TARGET)
 all-attention-multi-gpu: dirs $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_MG_TARGET) $(FA2_OPT_TARGET)
 	@echo "Built all attention kernels (FP32, INT8, FA2, Multi-GPU, Optimized)"
 
+# =============================================================================
+# Inference Pipeline Kernels (RMSNorm, FFN, Embeddings, Sampling)
+# =============================================================================
+
+# RMSNorm kernel
+rmsnorm_kernel.o: rmsnorm_kernel.cu rmsnorm_kernel.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(RMSNORM_TARGET): rmsnorm_kernel.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built RMSNorm kernel: $(RMSNORM_TARGET)"
+
+rmsnorm: dirs $(RMSNORM_TARGET)
+	@echo "Built RMSNorm kernel"
+
+# FFN/MLP kernel (SwiGLU)
+ffn_kernel.o: ffn_kernel.cu ffn_kernel.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(FFN_TARGET): ffn_kernel.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built FFN kernel: $(FFN_TARGET)"
+
+ffn: dirs $(FFN_TARGET)
+	@echo "Built FFN/MLP kernel (SwiGLU)"
+
+# Embeddings kernel (token lookup + RoPE)
+embeddings_kernel.o: embeddings_kernel.cu embeddings_kernel.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(EMBEDDINGS_TARGET): embeddings_kernel.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Embeddings kernel: $(EMBEDDINGS_TARGET)"
+
+embeddings: dirs $(EMBEDDINGS_TARGET)
+	@echo "Built Embeddings kernel (token lookup + RoPE)"
+
+# Sampling kernel (temperature, top-k, top-p)
+sampling_kernel.o: sampling_kernel.cu sampling_kernel.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@ -lcurand
+
+$(SAMPLING_TARGET): sampling_kernel.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart -lcurand
+	@echo "Built Sampling kernel: $(SAMPLING_TARGET)"
+
+sampling: dirs $(SAMPLING_TARGET)
+	@echo "Built Sampling kernel (temperature, top-k, top-p)"
+
+# Full inference pipeline library
+INFERENCE_OBJS = flash_attention_int8.o rmsnorm_kernel.o ffn_kernel.o embeddings_kernel.o sampling_kernel.o
+
+$(INFERENCE_TARGET): $(INFERENCE_OBJS)
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart -lcurand
+	@echo "Built EdgeLLM Inference library: $(INFERENCE_TARGET)"
+
+inference: dirs $(INFERENCE_OBJS) $(INFERENCE_TARGET)
+	@echo "Built complete EdgeLLM inference pipeline"
+
+# Build all inference kernels separately
+inference-all: dirs rmsnorm ffn embeddings sampling int8
+	@echo "Built all inference kernels (RMSNorm, FFN, Embeddings, Sampling, INT8 Attention)"
+
+# Build unified inference library (recommended)
+inference-unified: dirs $(INFERENCE_TARGET)
+	@echo "Built unified EdgeLLM inference library"
+
 # Test binary
 test: dirs $(OBJECTS)
 	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/test_cuda_kernel test_cuda_kernel.cu $(OBJECTS) -lcudart
@@ -184,6 +263,8 @@ test-all-multi-gpu: test-all test-fa2-multi-gpu
 # Clean
 clean:
 	rm -f $(OBJECTS) flash_attention_int8.o flash_attention_v2.o flash_attention_v2_multi_gpu.o flash_attention_v2_optimized.o $(TARGET) $(STATIC_TARGET) $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_MG_TARGET) $(FA2_OPT_TARGET)
+	rm -f rmsnorm_kernel.o ffn_kernel.o embeddings_kernel.o sampling_kernel.o
+	rm -f $(RMSNORM_TARGET) $(FFN_TARGET) $(EMBEDDINGS_TARGET) $(SAMPLING_TARGET) $(INFERENCE_TARGET)
 	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention $(BIN_DIR)/test_flash_attention_int8 $(BIN_DIR)/test_flash_attention_v2_multi_gpu $(BIN_DIR)/test_flash_attention_v2_optimized
 
 # Install to system (optional)
@@ -240,6 +321,7 @@ info:
 	@echo "Flash Attention: $(FA_TARGET)"
 	@echo "INT8 Flash Attention: $(INT8_TARGET)"
 	@echo "FA2 Multi-GPU: $(FA2_MG_TARGET)"
+	@echo "Inference Library: $(INFERENCE_TARGET)"
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo ""
 	@echo "Build targets:"
@@ -258,6 +340,14 @@ info:
 	@echo "  make jetson-nano - Jetson Nano (sm_53)"
 	@echo "  make jetson-orin - Jetson Orin (sm_87)"
 	@echo "  make rtx        - RTX 30/40 series"
+	@echo ""
+	@echo "Inference pipeline targets:"
+	@echo "  make rmsnorm    - Build RMSNorm kernel"
+	@echo "  make ffn        - Build FFN/MLP kernel (SwiGLU)"
+	@echo "  make embeddings - Build Embeddings kernel (token lookup + RoPE)"
+	@echo "  make sampling   - Build Sampling kernel (temperature, top-k, top-p)"
+	@echo "  make inference-all     - Build all inference kernels separately"
+	@echo "  make inference-unified - Build unified inference library (RECOMMENDED)"
 	@echo ""
 	@echo "Test targets:"
 	@echo "  make test       - Run T-MAC kernel tests"
