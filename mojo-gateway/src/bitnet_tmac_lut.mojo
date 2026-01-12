@@ -21,6 +21,7 @@ import time
 # CUDA kernel imports (optional - gracefully degrades to CPU if unavailable)
 var _cuda_available: Bool = False
 var _cuda_initialized: Bool = False
+var _flash_attention_enabled: Bool = False
 
 fn try_init_cuda() -> Bool:
     """Try to initialize CUDA. Returns True if successful."""
@@ -35,6 +36,41 @@ fn try_init_cuda() -> Bool:
     except:
         pass
     return False
+
+
+fn try_init_flash_attention(n_heads: Int, seq_len: Int, head_dim: Int) -> Bool:
+    """
+    Try to initialize Flash Attention. Returns True if successful.
+
+    Args:
+        n_heads: Number of attention heads
+        seq_len: Maximum sequence length
+        head_dim: Dimension per head
+    """
+    try:
+        from src.edgellm.ffi.cuda_kernel import (
+            flash_attention_init,
+            flash_attention_init_kv_cache,
+            flash_attention_available,
+        )
+
+        # Initialize Flash Attention buffers
+        var success = flash_attention_init(1, n_heads, seq_len, head_dim)
+        if not success:
+            print("Warning: Flash Attention init failed")
+            return False
+
+        # Initialize KV cache
+        success = flash_attention_init_kv_cache(1, n_heads, seq_len, head_dim)
+        if not success:
+            print("Warning: Flash Attention KV cache init failed")
+            return False
+
+        print("Flash Attention: ENABLED (n_heads=", n_heads, ", seq_len=", seq_len, ", head_dim=", head_dim, ")")
+        return True
+    except e:
+        print("Flash Attention: NOT AVAILABLE -", str(e))
+        return False
 
 
 # =============================================================================
@@ -756,6 +792,73 @@ fn softmax_cuda_call(
     return softmax_cuda(ptr, ptr, 1, size)
 
 
+fn flash_attention_decode_call(
+    q_ptr: UnsafePointer[Float32],
+    k_ptr: UnsafePointer[Float32],
+    v_ptr: UnsafePointer[Float32],
+    output_ptr: UnsafePointer[Float32],
+    batch_heads: Int,
+    cache_pos: Int,
+    head_dim: Int,
+) raises -> Bool:
+    """
+    Flash Attention decode for single token generation.
+
+    This is the critical path for inference throughput.
+    Uses Flash Attention's optimized decode kernel with KV cache.
+
+    Args:
+        q_ptr: Query tensor [batch_heads * head_dim]
+        k_ptr: New key to cache [batch_heads * head_dim]
+        v_ptr: New value to cache [batch_heads * head_dim]
+        output_ptr: Output tensor [batch_heads * head_dim]
+        batch_heads: batch * num_heads
+        cache_pos: Current position in KV cache
+        head_dim: Head dimension
+
+    Returns:
+        True on success, False on failure.
+    """
+    from src.edgellm.ffi.cuda_kernel import flash_attention_decode
+
+    return flash_attention_decode(q_ptr, k_ptr, v_ptr, output_ptr,
+                                   batch_heads, cache_pos, head_dim)
+
+
+fn flash_attention_forward_call(
+    q_ptr: UnsafePointer[Float32],
+    k_ptr: UnsafePointer[Float32],
+    v_ptr: UnsafePointer[Float32],
+    output_ptr: UnsafePointer[Float32],
+    batch_heads: Int,
+    seq_len: Int,
+    head_dim: Int,
+    causal: Bool = True,
+) raises -> Bool:
+    """
+    Flash Attention forward pass for prefill.
+
+    Used during prompt processing (prefill phase).
+
+    Args:
+        q_ptr: Query tensor [batch_heads * seq_len * head_dim]
+        k_ptr: Key tensor [batch_heads * seq_len * head_dim]
+        v_ptr: Value tensor [batch_heads * seq_len * head_dim]
+        output_ptr: Output tensor [batch_heads * seq_len * head_dim]
+        batch_heads: batch * num_heads
+        seq_len: Sequence length
+        head_dim: Head dimension
+        causal: Whether to use causal masking
+
+    Returns:
+        True on success, False on failure.
+    """
+    from src.edgellm.ffi.cuda_kernel import flash_attention_forward
+
+    return flash_attention_forward(q_ptr, k_ptr, v_ptr, output_ptr,
+                                    batch_heads, seq_len, head_dim, causal)
+
+
 fn forward_cuda(
     mut state: RunState,
     weights: FlatWeights,
@@ -866,6 +969,222 @@ fn forward_cuda(
                 state.xb[q_head_offset + i] = sum_val
 
         parallelize[compute_head](n_heads)
+
+        # Attention sub-norm (CUDA)
+        _ = rmsnorm_cuda_call(xb2_ptr, xb_ptr, float_ptr,
+                              weights.layer_attn_sub_norm[layer], dim)
+
+        # Output projection using CUDA T-MAC (NO LUT REBUILD!)
+        _ = tmac_matmul_cuda_call(xb_ptr, ternary_ptr, xb2_ptr, scales_ptr,
+                                   weights.layer_o_weight[layer], weights.layer_o_scale[layer],
+                                   dim, 1, dim)
+
+        # Residual connection
+        for i in range(dim):
+            state.x[i] += state.xb[i]
+
+        # Post-attention norm (CUDA)
+        _ = rmsnorm_cuda_call(xb_ptr, x_ptr, float_ptr,
+                              weights.layer_post_norm[layer], dim)
+
+        # FFN: gate and up projections using CUDA T-MAC (NO LUT REBUILD!)
+        _ = tmac_matmul_cuda_call(hb_ptr, ternary_ptr, xb_ptr, scales_ptr,
+                                   weights.layer_gate_weight[layer], weights.layer_gate_scale[layer],
+                                   hidden_dim, 1, dim)
+        _ = tmac_matmul_cuda_call(hb2_ptr, ternary_ptr, xb_ptr, scales_ptr,
+                                   weights.layer_up_weight[layer], weights.layer_up_scale[layer],
+                                   hidden_dim, 1, dim)
+
+        # ReLU squared and multiply (CPU - element-wise)
+        for i in range(hidden_dim):
+            var gate_val = state.hb[i]
+            if gate_val > 0:
+                gate_val = gate_val * gate_val
+            else:
+                gate_val = 0.0
+            state.hb[i] = gate_val * state.hb2[i]
+
+        # FFN sub-norm (CUDA)
+        _ = rmsnorm_cuda_call(hb2_ptr, hb_ptr, float_ptr,
+                              weights.layer_ffn_sub_norm[layer], hidden_dim)
+
+        # Down projection using CUDA T-MAC (NO LUT REBUILD!)
+        _ = tmac_matmul_cuda_call(xb_ptr, ternary_ptr, hb2_ptr, scales_ptr,
+                                   weights.layer_down_weight[layer], weights.layer_down_scale[layer],
+                                   dim, 1, hidden_dim)
+
+        # Residual connection
+        for i in range(dim):
+            state.x[i] += state.xb[i]
+
+    # Final norm (CUDA)
+    _ = rmsnorm_cuda_call(xb_ptr, x_ptr, float_ptr,
+                          weights.final_norm_offset, dim)
+    for i in range(dim):
+        state.x[i] = state.xb[i]
+
+    # LM head using CUDA T-MAC (NO LUT REBUILD!)
+    _ = tmac_matmul_cuda_call(logits_ptr, ternary_ptr, x_ptr, scales_ptr,
+                               weights.lm_head_offset, weights.lm_head_scale_offset,
+                               config.vocab_size, 1, dim)
+
+
+fn forward_cuda_flash(
+    mut state: RunState,
+    weights: FlatWeights,
+    config: Config,
+    token: Int,
+    pos: Int
+) raises:
+    """
+    CUDA-accelerated forward pass with Flash Attention.
+
+    Key differences from forward_cuda:
+    - Uses Flash Attention for memory-efficient O(N) attention
+    - Optimized decode kernel for single-token generation
+    - Better cache utilization for long sequences
+
+    Requirements:
+    - Flash Attention must be initialized via try_init_flash_attention()
+    - GQA is handled by expanding K/V to match query heads
+    """
+    var dim = config.dim
+    var hidden_dim = config.hidden_dim
+    var n_heads = config.n_heads
+    var n_kv_heads = config.n_kv_heads
+    var head_size = config.head_size
+    var kv_dim = config.kv_dim
+    var kv_mul = config.kv_mul
+
+    # Get raw pointers for CUDA calls
+    var ternary_ptr = weights.ternary_data.unsafe_ptr()
+    var scales_ptr = weights.scales.unsafe_ptr()
+    var float_ptr = weights.float_data.unsafe_ptr()
+
+    var x_ptr = state.x.unsafe_ptr()
+    var xb_ptr = state.xb.unsafe_ptr()
+    var xb2_ptr = state.xb2.unsafe_ptr()
+    var hb_ptr = state.hb.unsafe_ptr()
+    var hb2_ptr = state.hb2.unsafe_ptr()
+    var q_ptr = state.q.unsafe_ptr()
+    var k_ptr = state.k.unsafe_ptr()
+    var v_ptr = state.v.unsafe_ptr()
+    var att_ptr = state.att.unsafe_ptr()
+    var logits_ptr = state.logits.unsafe_ptr()
+
+    # Temporary buffers for expanded K/V (for GQA)
+    # These expand kv_heads to n_heads by repeating each kv_head kv_mul times
+    var k_expanded = List[Float32]()
+    var v_expanded = List[Float32]()
+    var output_attn = List[Float32]()
+    for _ in range(dim):  # n_heads * head_size
+        k_expanded.append(0.0)
+        v_expanded.append(0.0)
+        output_attn.append(0.0)
+
+    var k_exp_ptr = k_expanded.unsafe_ptr()
+    var v_exp_ptr = v_expanded.unsafe_ptr()
+    var out_attn_ptr = output_attn.unsafe_ptr()
+
+    # Get token embedding (same as CPU - small operation)
+    var embed_bytes_per_row = (dim + 3) // 4
+    var embed_w_offset = weights.embed_offset + token * embed_bytes_per_row
+    var embed_s_offset = weights.embed_scale_offset + token
+    var embed_scale = weights.scales[embed_s_offset]
+
+    for i in range(dim):
+        var byte_idx = i // 4
+        var bit_pos = (i % 4) * 2
+        var byte_val = Int(weights.ternary_data[embed_w_offset + byte_idx])
+        var bits = (byte_val >> bit_pos) & 0x03
+        var w: Float32
+        if bits == 0:
+            w = 0.0
+        elif bits == 1:
+            w = 1.0
+        else:
+            w = -1.0
+        state.x[i] = w * embed_scale
+
+    # Process each layer
+    for layer in range(config.n_layers):
+        # Input normalization (CUDA)
+        _ = rmsnorm_cuda_call(xb_ptr, x_ptr, float_ptr,
+                              weights.layer_input_norm[layer], dim)
+
+        # QKV projections using CUDA T-MAC (NO LUT REBUILD!)
+        _ = tmac_matmul_cuda_call(q_ptr, ternary_ptr, xb_ptr, scales_ptr,
+                                   weights.layer_q_weight[layer], weights.layer_q_scale[layer],
+                                   dim, 1, dim)
+        _ = tmac_matmul_cuda_call(k_ptr, ternary_ptr, xb_ptr, scales_ptr,
+                                   weights.layer_k_weight[layer], weights.layer_k_scale[layer],
+                                   kv_dim, 1, dim)
+        _ = tmac_matmul_cuda_call(v_ptr, ternary_ptr, xb_ptr, scales_ptr,
+                                   weights.layer_v_weight[layer], weights.layer_v_scale[layer],
+                                   kv_dim, 1, dim)
+
+        # RoPE (CPU - trigonometric, hard to parallelize)
+        rope(state.q, state.k, 0, 0, head_size, n_heads, n_kv_heads, pos, config.rope_theta)
+
+        # Expand K and V from kv_heads to n_heads for Flash Attention
+        # GQA: Each KV head is shared by kv_mul query heads
+        for h in range(n_heads):
+            var kv_head = h // kv_mul
+            var src_offset = kv_head * head_size
+            var dst_offset = h * head_size
+            for d in range(head_size):
+                k_expanded[dst_offset + d] = state.k[src_offset + d]
+                v_expanded[dst_offset + d] = state.v[src_offset + d]
+
+        # Flash Attention Decode (single token)
+        # Q, K_new, V_new are all [n_heads * head_size]
+        # This internally manages the KV cache
+        var fa_success = flash_attention_decode_call(
+            q_ptr,
+            k_exp_ptr,
+            v_exp_ptr,
+            out_attn_ptr,
+            n_heads,
+            pos,
+            head_size
+        )
+
+        if not fa_success:
+            # Fallback to CPU attention if Flash Attention fails
+            # Cache KV
+            var cache_offset = layer * config.seq_len * kv_dim + pos * kv_dim
+            for i in range(kv_dim):
+                state.key_cache[cache_offset + i] = state.k[i]
+                state.value_cache[cache_offset + i] = state.v[i]
+
+            # CPU attention
+            @parameter
+            fn compute_head_fallback(h: Int):
+                var q_head_offset = h * head_size
+                var att_offset = h * config.seq_len
+                var kv_head = h // kv_mul
+
+                for t in range(pos + 1):
+                    var k_cache_offset = layer * config.seq_len * kv_dim + t * kv_dim + kv_head * head_size
+                    var score: Float32 = 0.0
+                    for i in range(head_size):
+                        score += state.q[q_head_offset + i] * state.key_cache[k_cache_offset + i]
+                    state.att[att_offset + t] = score / math.sqrt(Float32(head_size))
+
+                softmax(state.att, att_offset, pos + 1)
+
+                for i in range(head_size):
+                    var sum_val: Float32 = 0.0
+                    for t in range(pos + 1):
+                        var v_cache_offset = layer * config.seq_len * kv_dim + t * kv_dim + kv_head * head_size
+                        sum_val += state.att[att_offset + t] * state.value_cache[v_cache_offset + i]
+                    output_attn[q_head_offset + i] = sum_val
+
+            parallelize[compute_head_fallback](n_heads)
+
+        # Copy attention output to xb
+        for i in range(dim):
+            state.xb[i] = output_attn[i]
 
         # Attention sub-norm (CUDA)
         _ = rmsnorm_cuda_call(xb2_ptr, xb_ptr, float_ptr,
@@ -1040,6 +1359,7 @@ fn main() raises:
 
     # Try to initialize CUDA
     var use_cuda = False
+    var use_flash_attention = False
     if not force_cpu:
         use_cuda = try_init_cuda()
         if use_cuda:
@@ -1047,6 +1367,15 @@ fn main() raises:
             print("CUDA acceleration ENABLED")
             print("  - No LUT rebuilding overhead (was 150x per token)")
             print("  - GPU-parallel matrix operations")
+
+            # Try to initialize Flash Attention
+            use_flash_attention = try_init_flash_attention(
+                config.n_heads,
+                config.seq_len,
+                config.head_size
+            )
+            if use_flash_attention:
+                _flash_attention_enabled = True
         else:
             print()
             print("CUDA not available, using CPU backend")
@@ -1060,7 +1389,13 @@ fn main() raises:
     print()
     print("Generating", num_tokens, "tokens...")
     print("Temperature:", temperature, "Top-p:", topp)
-    print("Backend:", "CUDA" if use_cuda else "CPU (LUT)")
+    var backend_name = "CPU (LUT)"
+    if use_cuda:
+        if use_flash_attention:
+            backend_name = "CUDA + Flash Attention"
+        else:
+            backend_name = "CUDA"
+    print("Backend:", backend_name)
     print("-" * 50)
 
     # Use BOS token (typically 0 or 1, clamped to vocab size for safety)
@@ -1070,7 +1405,10 @@ fn main() raises:
 
     for pos in range(num_tokens):
         if use_cuda:
-            forward_cuda(state, weights, config, token, pos)
+            if use_flash_attention:
+                forward_cuda_flash(state, weights, config, token, pos)
+            else:
+                forward_cuda(state, weights, config, token, pos)
         else:
             forward(state, weights, config, token, pos)
 
@@ -1094,14 +1432,16 @@ fn main() raises:
     print()
     print("Generated", tokens_generated, "tokens in", elapsed_s, "seconds")
     print("Speed:", tok_per_sec, "tok/s")
-    print("Backend:", "CUDA" if use_cuda else "CPU (LUT)")
+    print("Backend:", backend_name)
     print()
     print("Note: Output shows token IDs. Use a tokenizer to decode to text.")
 
-    # Cleanup CUDA resources
+    # Cleanup resources
     if use_cuda:
         try:
-            from src.edgellm.ffi.cuda_kernel import cuda_cleanup
+            from src.edgellm.ffi.cuda_kernel import cuda_cleanup, flash_attention_cleanup
+            if use_flash_attention:
+                flash_attention_cleanup()
             cuda_cleanup()
         except:
             pass

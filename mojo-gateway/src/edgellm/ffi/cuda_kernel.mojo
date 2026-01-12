@@ -750,3 +750,285 @@ fn fused_rmsnorm_matmul_cuda_adaptive_v2(
         input, output, M, N, K, eps
     )
     return result == 0
+
+
+# ============================================================================
+# Phase 4: Flash Attention API
+# ============================================================================
+
+# Flash Attention state (lazy loaded)
+var _flash_attention_loaded: Bool = False
+var _flash_attention_kv_ready: Bool = False
+
+
+fn _load_flash_attention_lib() raises -> DLHandle:
+    """Load the Flash Attention shared library."""
+    var paths = List[String](
+        "./lib/libflash_attention.dylib",
+        "./lib/libflash_attention.so",
+        "./lib/libtmac_kernel_cuda.dylib",  # FA is included in main lib
+        "./lib/libtmac_kernel_cuda.so",
+        "/usr/local/lib/libflash_attention.dylib",
+        "/usr/local/lib/libflash_attention.so",
+    )
+
+    for i in range(len(paths)):
+        try:
+            return DLHandle(paths[i])
+        except:
+            continue
+
+    raise Error("Flash Attention library not found. Build with 'make flash' in src/kernels/cuda/")
+
+
+fn get_flash_attention_lib() raises -> DLHandle:
+    """Get the Flash Attention library (uses same handle as CUDA kernel)."""
+    return get_cuda_kernel()  # FA is linked into main CUDA lib
+
+
+fn flash_attention_init(
+    max_batch: Int,
+    num_heads: Int,
+    max_sequence_len: Int,
+    head_dim: Int,
+) raises -> Bool:
+    """
+    Initialize Flash Attention buffers.
+
+    Allocates device memory for Q, K, V, O tensors.
+
+    Args:
+        max_batch: Maximum batch size
+        num_heads: Number of attention heads
+        max_sequence_len: Maximum sequence length
+        head_dim: Dimension per head (typically 64 or 128)
+
+    Returns:
+        True on success, False on failure.
+    """
+    if not cuda_available():
+        return False
+
+    var kernel = get_flash_attention_lib()
+    var result = kernel.call["flash_attention_init", Int](
+        max_batch, num_heads, max_sequence_len, head_dim
+    )
+    if result == 0:
+        _flash_attention_loaded = True
+    return result == 0
+
+
+fn flash_attention_init_kv_cache(
+    max_batch: Int,
+    num_heads: Int,
+    max_cache_len: Int,
+    head_dim: Int,
+) raises -> Bool:
+    """
+    Initialize KV cache for inference/decoding.
+
+    Allocates separate buffers for cached keys and values.
+    Required for efficient autoregressive generation.
+
+    Args:
+        max_batch: Maximum batch size
+        num_heads: Number of attention heads
+        max_cache_len: Maximum cache length (max context window)
+        head_dim: Dimension per head
+
+    Returns:
+        True on success, False on failure.
+    """
+    if not cuda_available():
+        return False
+
+    var kernel = get_flash_attention_lib()
+    var result = kernel.call["flash_attention_init_kv_cache", Int](
+        max_batch, num_heads, max_cache_len, head_dim
+    )
+    if result == 0:
+        _flash_attention_kv_ready = True
+    return result == 0
+
+
+fn flash_attention_cleanup() raises:
+    """Cleanup Flash Attention resources."""
+    if _flash_attention_loaded:
+        var kernel = get_flash_attention_lib()
+        kernel.call["flash_attention_cleanup", NoneType]()
+        _flash_attention_loaded = False
+        _flash_attention_kv_ready = False
+
+
+fn flash_attention_forward(
+    Q: UnsafePointer[Float32],
+    K: UnsafePointer[Float32],
+    V: UnsafePointer[Float32],
+    O: UnsafePointer[Float32],
+    batch_heads: Int,
+    seq_len: Int,
+    head_dim: Int,
+    causal: Bool = True,
+) raises -> Bool:
+    """
+    Flash Attention Forward Pass.
+
+    Computes: O = softmax(Q @ K^T / sqrt(d_k)) @ V
+
+    Uses tiled computation with online softmax for O(N) memory.
+
+    Args:
+        Q: Query tensor [batch_heads, seq_len, head_dim]
+        K: Key tensor [batch_heads, seq_len, head_dim]
+        V: Value tensor [batch_heads, seq_len, head_dim]
+        O: Output tensor [batch_heads, seq_len, head_dim]
+        batch_heads: batch * num_heads
+        seq_len: Sequence length
+        head_dim: Head dimension
+        causal: True for causal (decoder) attention
+
+    Returns:
+        True on success, False on failure.
+    """
+    if not cuda_available():
+        return False
+
+    var kernel = get_flash_attention_lib()
+    var causal_int = 1 if causal else 0
+    var result = kernel.call["flash_attention_forward", Int](
+        Q, K, V, O, batch_heads, seq_len, head_dim, causal_int
+    )
+    return result == 0
+
+
+fn flash_attention_decode(
+    Q: UnsafePointer[Float32],
+    K_new: UnsafePointer[Float32],
+    V_new: UnsafePointer[Float32],
+    O: UnsafePointer[Float32],
+    batch_heads: Int,
+    cache_pos: Int,
+    head_dim: Int,
+) raises -> Bool:
+    """
+    Flash Attention Decode - Single token with KV cache.
+
+    Optimized for autoregressive generation where:
+    - Q has shape [batch_heads, 1, head_dim] (single new token)
+    - K_new, V_new are appended to cache
+    - Attends over all cached tokens
+
+    Args:
+        Q: Query for new token [batch_heads, head_dim]
+        K_new: New key to append to cache [batch_heads, head_dim]
+        V_new: New value to append to cache [batch_heads, head_dim]
+        O: Output [batch_heads, head_dim]
+        batch_heads: batch * num_heads
+        cache_pos: Current position in cache (0-indexed)
+        head_dim: Head dimension
+
+    Returns:
+        True on success, False on failure.
+    """
+    if not cuda_available():
+        return False
+
+    var kernel = get_flash_attention_lib()
+    var result = kernel.call["flash_attention_decode", Int](
+        Q, K_new, V_new, O, batch_heads, cache_pos, head_dim
+    )
+    return result == 0
+
+
+fn flash_attention_update_kv_cache(
+    K: UnsafePointer[Float32],
+    V: UnsafePointer[Float32],
+    batch_heads: Int,
+    start_pos: Int,
+    num_tokens: Int,
+    head_dim: Int,
+) raises -> Bool:
+    """
+    Update KV cache directly.
+
+    Used during prefill phase to populate cache with initial context.
+
+    Args:
+        K: Keys to cache [batch_heads, num_tokens, head_dim]
+        V: Values to cache [batch_heads, num_tokens, head_dim]
+        batch_heads: batch * num_heads
+        start_pos: Starting position in cache
+        num_tokens: Number of tokens to cache
+        head_dim: Head dimension
+
+    Returns:
+        True on success, False on failure.
+    """
+    if not cuda_available():
+        return False
+
+    var kernel = get_flash_attention_lib()
+    var result = kernel.call["flash_attention_update_kv_cache", Int](
+        K, V, batch_heads, start_pos, num_tokens, head_dim
+    )
+    return result == 0
+
+
+struct FlashAttentionInfo:
+    """Flash Attention status information."""
+    var initialized: Bool
+    var kv_cache_ready: Bool
+    var max_seq_len: Int
+    var head_dim: Int
+
+    fn __init__(out self):
+        self.initialized = False
+        self.kv_cache_ready = False
+        self.max_seq_len = 0
+        self.head_dim = 0
+
+
+fn flash_attention_info() raises -> FlashAttentionInfo:
+    """
+    Get Flash Attention status info.
+
+    Returns:
+        FlashAttentionInfo struct with current state.
+    """
+    var info = FlashAttentionInfo()
+
+    if not cuda_available():
+        return info
+
+    var kernel = get_flash_attention_lib()
+
+    var initialized = UnsafePointer[Int].alloc(1)
+    var cache_ready = UnsafePointer[Int].alloc(1)
+    var max_seq = UnsafePointer[Int].alloc(1)
+    var head_d = UnsafePointer[Int].alloc(1)
+
+    kernel.call["flash_attention_info", NoneType](
+        initialized, cache_ready, max_seq, head_d
+    )
+
+    info.initialized = initialized[0] == 1
+    info.kv_cache_ready = cache_ready[0] == 1
+    info.max_seq_len = max_seq[0]
+    info.head_dim = head_d[0]
+
+    initialized.free()
+    cache_ready.free()
+    max_seq.free()
+    head_d.free()
+
+    return info
+
+
+fn flash_attention_available() -> Bool:
+    """Check if Flash Attention is available and initialized."""
+    return _flash_attention_loaded
+
+
+fn flash_attention_kv_cache_ready() -> Bool:
+    """Check if KV cache is initialized."""
+    return _flash_attention_kv_ready

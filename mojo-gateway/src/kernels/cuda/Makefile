@@ -35,9 +35,11 @@ BIN_DIR = ../../../bin
 # Targets
 TARGET = $(LIB_DIR)/libtmac_kernel_cuda.$(SHARED_EXT)
 STATIC_TARGET = $(LIB_DIR)/libtmac_kernel_cuda.a
+FA_TARGET = $(LIB_DIR)/libflash_attention.$(SHARED_EXT)
 
-SOURCES = tmac_kernel.cu
-OBJECTS = tmac_kernel.o
+SOURCES = tmac_kernel.cu flash_attention.cu
+OBJECTS = tmac_kernel.o flash_attention.o
+HEADERS = tmac_kernel_cuda.h flash_attention.h
 
 .PHONY: all clean test install dirs check info
 
@@ -59,8 +61,17 @@ $(STATIC_TARGET): $(OBJECTS)
 	ar rcs $@ $^
 	@echo "Built static library: $(STATIC_TARGET)"
 
-%.o: %.cu tmac_kernel_cuda.h
+%.o: %.cu $(HEADERS)
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+# Separate Flash Attention library
+$(FA_TARGET): flash_attention.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Flash Attention: $(FA_TARGET)"
+
+# Build all libraries including Flash Attention
+flash: dirs $(TARGET) $(FA_TARGET)
+	@echo "Built all CUDA kernels including Flash Attention"
 
 # Test binary
 test: dirs $(OBJECTS)
@@ -68,10 +79,19 @@ test: dirs $(OBJECTS)
 	@echo "Running CUDA tests..."
 	$(BIN_DIR)/test_cuda_kernel
 
+# Flash Attention test
+test-flash: dirs flash_attention.o
+	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/test_flash_attention test_flash_attention.cu flash_attention.o -lcudart
+	@echo "Running Flash Attention tests..."
+	$(BIN_DIR)/test_flash_attention
+
+# Test all
+test-all: test test-flash
+
 # Clean
 clean:
-	rm -f $(OBJECTS) $(TARGET) $(STATIC_TARGET)
-	rm -f $(BIN_DIR)/test_cuda_kernel
+	rm -f $(OBJECTS) $(TARGET) $(STATIC_TARGET) $(FA_TARGET)
+	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention
 
 # Install to system (optional)
 install: $(TARGET)
@@ -124,13 +144,20 @@ info:
 	@echo "NVCC: $(shell which nvcc 2>/dev/null || echo 'not found')"
 	@nvcc --version 2>/dev/null || echo "CUDA not available"
 	@echo "Target: $(TARGET)"
+	@echo "Flash Attention: $(FA_TARGET)"
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  make            - Default multi-arch build"
+	@echo "  make flash      - Build with Flash Attention"
 	@echo "  make tensorcore - INT8 Tensor Core optimized (sm_75+)"
 	@echo "  make t4         - Tesla T4 optimized (Kaggle/Colab)"
 	@echo "  make a100       - A100 optimized"
 	@echo "  make jetson-nano - Jetson Nano (sm_53)"
 	@echo "  make jetson-orin - Jetson Orin (sm_87)"
 	@echo "  make rtx        - RTX 30/40 series"
+	@echo ""
+	@echo "Test targets:"
+	@echo "  make test       - Run T-MAC kernel tests"
+	@echo "  make test-flash - Run Flash Attention tests"
+	@echo "  make test-all   - Run all tests"
