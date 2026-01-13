@@ -1382,10 +1382,13 @@ static float* d_attn_O = nullptr;
 static int8_t* d_attn_Q_i8 = nullptr;
 static int8_t* d_attn_K_i8 = nullptr;
 static int8_t* d_attn_V_i8 = nullptr;
+static float* d_attn_partial_max = nullptr;  // Workspace for quantization
+static cudaStream_t attn_stream = nullptr;   // Async stream
 static int attn_stateless_max_batch_heads = 0;
 static int attn_stateless_max_cache = 0;
 static int attn_stateless_head_dim = 0;
 static int attn_stateless_initialized = 0;
+static int attn_max_blocks = 0;  // For workspace sizing
 
 int attention_stateless_init(int max_batch_heads, int max_cache_len, int head_dim) {
     if (attn_stateless_initialized) {
@@ -1403,10 +1406,16 @@ int attention_stateless_init(int max_batch_heads, int max_cache_len, int head_di
         if (d_attn_Q_i8) cudaFree(d_attn_Q_i8);
         if (d_attn_K_i8) cudaFree(d_attn_K_i8);
         if (d_attn_V_i8) cudaFree(d_attn_V_i8);
+        if (d_attn_partial_max) cudaFree(d_attn_partial_max);
+        if (attn_stream) cudaStreamDestroy(attn_stream);
     }
 
     size_t q_size = max_batch_heads * head_dim * sizeof(float);
     size_t kv_size = max_batch_heads * max_cache_len * head_dim * sizeof(float);
+
+    // Calculate workspace size for quantization (max elements we'll ever quantize)
+    int max_kv_elements = max_batch_heads * max_cache_len * head_dim;
+    int max_blocks = (max_kv_elements + 255) / 256;
 
     CUDA_CHECK(cudaMalloc(&d_attn_Q, q_size));
     CUDA_CHECK(cudaMalloc(&d_attn_K, kv_size));
@@ -1416,9 +1425,16 @@ int attention_stateless_init(int max_batch_heads, int max_cache_len, int head_di
     CUDA_CHECK(cudaMalloc(&d_attn_K_i8, max_batch_heads * max_cache_len * head_dim));
     CUDA_CHECK(cudaMalloc(&d_attn_V_i8, max_batch_heads * max_cache_len * head_dim));
 
+    // Allocate persistent workspace for quantization
+    CUDA_CHECK(cudaMalloc(&d_attn_partial_max, (max_blocks + 1) * sizeof(float)));
+
+    // Create CUDA stream for async operations
+    CUDA_CHECK(cudaStreamCreate(&attn_stream));
+
     attn_stateless_max_batch_heads = max_batch_heads;
     attn_stateless_max_cache = max_cache_len;
     attn_stateless_head_dim = head_dim;
+    attn_max_blocks = max_blocks;
     attn_stateless_initialized = 1;
 
     printf("Stateless attention initialized: batch_heads=%d, cache=%d, head_dim=%d\n",
@@ -1435,7 +1451,10 @@ void attention_stateless_cleanup(void) {
     if (d_attn_Q_i8) { cudaFree(d_attn_Q_i8); d_attn_Q_i8 = nullptr; }
     if (d_attn_K_i8) { cudaFree(d_attn_K_i8); d_attn_K_i8 = nullptr; }
     if (d_attn_V_i8) { cudaFree(d_attn_V_i8); d_attn_V_i8 = nullptr; }
+    if (d_attn_partial_max) { cudaFree(d_attn_partial_max); d_attn_partial_max = nullptr; }
+    if (attn_stream) { cudaStreamDestroy(attn_stream); attn_stream = nullptr; }
     attn_stateless_initialized = 0;
+    attn_max_blocks = 0;
 }
 
 // Forward declarations
@@ -1535,7 +1554,8 @@ __global__ void attention_fp32_kernel(
 }
 
 /**
- * Pure FP32 stateless attention with strided buffers (for debugging)
+ * Pure FP32 stateless attention with strided buffers
+ * OPTIMIZED: Uses persistent buffers and CUDA stream
  */
 int attention_fp32_strided(
     const float* Q,
@@ -1547,31 +1567,36 @@ int attention_fp32_strided(
     int head_dim,
     int buffer_seq_len
 ) {
-    // Allocate device memory
-    float* d_Q;
-    float* d_K;
-    float* d_V;
-    float* d_O;
+    // Auto-initialize if needed
+    if (!attn_stateless_initialized) {
+        int ret = attention_stateless_init(batch_heads, buffer_seq_len, head_dim);
+        if (ret != 0) return ret;
+    }
+
+    // Validate sizes
+    if (batch_heads > attn_stateless_max_batch_heads ||
+        cache_len > attn_stateless_max_cache ||
+        head_dim != attn_stateless_head_dim) {
+        fprintf(stderr, "FP32 attention: size mismatch (heads=%d/%d, cache=%d/%d, dim=%d/%d)\n",
+                batch_heads, attn_stateless_max_batch_heads,
+                cache_len, attn_stateless_max_cache,
+                head_dim, attn_stateless_head_dim);
+        return -1;
+    }
 
     size_t q_size = batch_heads * head_dim * sizeof(float);
-    size_t kv_contiguous_size = batch_heads * cache_len * head_dim * sizeof(float);
 
-    CUDA_CHECK(cudaMalloc(&d_Q, q_size));
-    CUDA_CHECK(cudaMalloc(&d_K, kv_contiguous_size));
-    CUDA_CHECK(cudaMalloc(&d_V, kv_contiguous_size));
-    CUDA_CHECK(cudaMalloc(&d_O, q_size));
+    // Async copy Q to device (use persistent buffer)
+    CUDA_CHECK(cudaMemcpyAsync(d_attn_Q, Q, q_size, cudaMemcpyHostToDevice, attn_stream));
 
-    // Copy Q (always contiguous)
-    CUDA_CHECK(cudaMemcpy(d_Q, Q, q_size, cudaMemcpyHostToDevice));
-
-    // Copy K, V with stride handling
+    // Copy K, V with stride handling (async, use persistent buffers)
     for (int h = 0; h < batch_heads; h++) {
         size_t src_offset = h * buffer_seq_len * head_dim;
         size_t dst_offset = h * cache_len * head_dim;
         size_t copy_size = cache_len * head_dim * sizeof(float);
 
-        CUDA_CHECK(cudaMemcpy(d_K + dst_offset, K_cache + src_offset, copy_size, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_V + dst_offset, V_cache + src_offset, copy_size, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(d_attn_K + dst_offset, K_cache + src_offset, copy_size, cudaMemcpyHostToDevice, attn_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_attn_V + dst_offset, V_cache + src_offset, copy_size, cudaMemcpyHostToDevice, attn_stream));
     }
 
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -1582,20 +1607,16 @@ int attention_fp32_strided(
     dim3 grid(batch_heads);
     dim3 block(128);
 
-    attention_fp32_kernel<<<grid, block, smem_size>>>(
-        d_Q, d_K, d_V, d_O,
+    attention_fp32_kernel<<<grid, block, smem_size, attn_stream>>>(
+        d_attn_Q, d_attn_K, d_attn_V, d_attn_O,
         cache_len, head_dim, scale
     );
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Copy result back
-    CUDA_CHECK(cudaMemcpy(O, d_O, q_size, cudaMemcpyDeviceToHost));
+    // Async copy result back
+    CUDA_CHECK(cudaMemcpyAsync(O, d_attn_O, q_size, cudaMemcpyDeviceToHost, attn_stream));
 
-    // Cleanup
-    cudaFree(d_Q);
-    cudaFree(d_K);
-    cudaFree(d_V);
-    cudaFree(d_O);
+    // Sync stream before returning
+    CUDA_CHECK(cudaStreamSynchronize(attn_stream));
 
     return 0;
 }
@@ -1619,40 +1640,51 @@ int attention_stateless_fast(
 }
 
 /**
- * Helper: Proper multi-block quantization
+ * Helper: Proper multi-block quantization with pre-allocated workspace
  * Returns the max value (dequant scale = max / 127)
+ *
+ * @param d_input      Input FP32 tensor (device)
+ * @param d_output     Output INT8 tensor (device)
+ * @param size         Number of elements
+ * @param d_workspace  Pre-allocated workspace [num_blocks + 1] floats
+ * @param num_blocks   Number of thread blocks
+ * @param stream       CUDA stream (can be null for sync)
  */
 static float quantize_tensor_proper(
     const float* d_input,
     int8_t* d_output,
     int size,
-    float* d_partial_max,  // Workspace for partial maxes
-    int num_blocks
+    float* d_workspace,
+    int num_blocks,
+    cudaStream_t stream
 ) {
     dim3 block(256);
     dim3 grid(num_blocks);
 
+    // Use last element of workspace for final max
+    float* d_partial_max = d_workspace;
+    float* d_final_max = d_workspace + num_blocks;
+
     // Pass 1: Find max per block
-    find_max_kernel<<<grid, block>>>(d_input, d_partial_max, size);
+    find_max_kernel<<<grid, block, 0, stream>>>(d_input, d_partial_max, size);
 
-    // Pass 2: Reduce to single max
-    float* d_final_max;
-    cudaMalloc(&d_final_max, sizeof(float));
-    reduce_max_kernel<<<1, 256>>>(d_partial_max, d_final_max, num_blocks);
+    // Pass 2: Reduce to single max (use pre-allocated slot)
+    reduce_max_kernel<<<1, 256, 0, stream>>>(d_partial_max, d_final_max, num_blocks);
 
+    // Sync to get max value back to host
     float h_max;
-    cudaMemcpy(&h_max, d_final_max, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_final_max);
+    cudaMemcpyAsync(&h_max, d_final_max, sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
 
     // Pass 3: Quantize with computed scale
-    quantize_kernel<<<grid, block>>>(d_input, d_output, h_max, size);
+    quantize_kernel<<<grid, block, 0, stream>>>(d_input, d_output, h_max, size);
 
     return h_max / QUANT_SCALE;  // Return dequant scale
 }
 
 /**
  * Strided stateless INT8 attention - handles non-contiguous KV cache
- * FIXED: Uses proper multi-block quantization
+ * OPTIMIZED: Uses persistent buffers and CUDA stream
  *
  * Use when KV cache has layout [batch_heads, max_seq_len, head_dim]
  * but only cache_len positions are valid.
@@ -1690,33 +1722,27 @@ int attention_stateless_strided(
     int q_elements = batch_heads * head_dim;
     int kv_elements = batch_heads * cache_len * head_dim;
 
-    // Copy Q (always contiguous)
-    CUDA_CHECK(cudaMemcpy(d_attn_Q, Q, q_size, cudaMemcpyHostToDevice));
+    // Async copy Q to device
+    CUDA_CHECK(cudaMemcpyAsync(d_attn_Q, Q, q_size, cudaMemcpyHostToDevice, attn_stream));
 
-    // Copy K, V with stride handling
+    // Copy K, V with stride handling (async)
     for (int h = 0; h < batch_heads; h++) {
         size_t src_offset = h * buffer_seq_len * head_dim;
         size_t dst_offset = h * cache_len * head_dim;
         size_t copy_size = cache_len * head_dim * sizeof(float);
 
-        CUDA_CHECK(cudaMemcpy(d_attn_K + dst_offset, K_cache + src_offset, copy_size, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_attn_V + dst_offset, V_cache + src_offset, copy_size, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(d_attn_K + dst_offset, K_cache + src_offset, copy_size, cudaMemcpyHostToDevice, attn_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_attn_V + dst_offset, V_cache + src_offset, copy_size, cudaMemcpyHostToDevice, attn_stream));
     }
 
-    // Allocate workspace for quantization
+    // Use persistent workspace for quantization
     int num_blocks_q = (q_elements + 255) / 256;
     int num_blocks_kv = (kv_elements + 255) / 256;
-    int max_blocks = (num_blocks_q > num_blocks_kv) ? num_blocks_q : num_blocks_kv;
 
-    float* d_partial_max;
-    CUDA_CHECK(cudaMalloc(&d_partial_max, max_blocks * sizeof(float)));
-
-    // Proper multi-block quantization
-    float scale_q = quantize_tensor_proper(d_attn_Q, d_attn_Q_i8, q_elements, d_partial_max, num_blocks_q);
-    float scale_k = quantize_tensor_proper(d_attn_K, d_attn_K_i8, kv_elements, d_partial_max, num_blocks_kv);
-    float scale_v = quantize_tensor_proper(d_attn_V, d_attn_V_i8, kv_elements, d_partial_max, num_blocks_kv);
-
-    cudaFree(d_partial_max);
+    // Proper multi-block quantization using persistent workspace
+    float scale_q = quantize_tensor_proper(d_attn_Q, d_attn_Q_i8, q_elements, d_attn_partial_max, num_blocks_q, attn_stream);
+    float scale_k = quantize_tensor_proper(d_attn_K, d_attn_K_i8, kv_elements, d_attn_partial_max, num_blocks_kv, attn_stream);
+    float scale_v = quantize_tensor_proper(d_attn_V, d_attn_V_i8, kv_elements, d_attn_partial_max, num_blocks_kv, attn_stream);
 
     float attn_scale = 1.0f / sqrtf((float)head_dim);
 
@@ -1727,14 +1753,17 @@ int attention_stateless_strided(
     dim3 grid(batch_heads);
     dim3 block(TC_THREADS);
 
-    flash_attention_int8_decode_kernel<<<grid, block, smem_size>>>(
+    flash_attention_int8_decode_kernel<<<grid, block, smem_size, attn_stream>>>(
         d_attn_Q_i8, d_attn_K_i8, d_attn_V_i8, d_attn_O,
         scale_q, scale_k, scale_v,
         cache_len, head_dim, attn_scale
     );
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(O, d_attn_O, q_size, cudaMemcpyDeviceToHost));
+    // Async copy result back
+    CUDA_CHECK(cudaMemcpyAsync(O, d_attn_O, q_size, cudaMemcpyDeviceToHost, attn_stream));
+
+    // Sync stream before returning
+    CUDA_CHECK(cudaStreamSynchronize(attn_stream));
 
     return 0;
 }
