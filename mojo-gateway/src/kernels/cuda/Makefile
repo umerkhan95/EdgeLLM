@@ -49,6 +49,9 @@ RESIDUAL_TARGET = $(LIB_DIR)/libresiudal_add.$(SHARED_EXT)
 PIPELINE_TARGET = $(LIB_DIR)/libinference_pipeline.$(SHARED_EXT)
 INFERENCE_TARGET = $(LIB_DIR)/libedgellm_inference.$(SHARED_EXT)
 
+# cuBLAS full GPU inference (key for 400+ tok/s)
+CUBLAS_TARGET = $(LIB_DIR)/libcublas_matmul.$(SHARED_EXT)
+
 SOURCES = tmac_kernel.cu flash_attention.cu
 OBJECTS = tmac_kernel.o flash_attention.o
 HEADERS = tmac_kernel_cuda.h flash_attention.h flash_attention_int8.h inference_kernels.h
@@ -286,6 +289,27 @@ inference-unified: dirs $(INFERENCE_TARGET)
 inference-pipeline: dirs $(PIPELINE_TARGET)
 	@echo "Built complete EdgeLLM inference pipeline with orchestrator"
 
+# =============================================================================
+# cuBLAS Full GPU Inference (400+ tok/s target)
+# =============================================================================
+# This is the key kernel for achieving Ollama-level performance.
+# Uses cuBLAS for all matmuls + proper GQA attention kernel.
+
+cublas_matmul.o: cublas_matmul.cu cublas_matmul.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@ -lcublas
+
+$(CUBLAS_TARGET): cublas_matmul.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart -lcublas
+	@echo "Built cuBLAS matmul kernel: $(CUBLAS_TARGET)"
+
+# Build cuBLAS kernel (RECOMMENDED for full GPU inference)
+cublas: dirs cublas_matmul.o $(CUBLAS_TARGET)
+	@echo "Built cuBLAS full GPU inference kernel (400+ tok/s target)"
+
+# Build everything for full GPU inference
+gpu-inference: dirs $(CUBLAS_TARGET)
+	@echo "Built complete GPU inference library"
+
 # Test binary
 test: dirs $(OBJECTS)
 	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/test_cuda_kernel test_cuda_kernel.cu $(OBJECTS) -lcudart
@@ -321,6 +345,7 @@ clean:
 	rm -f $(OBJECTS) flash_attention_int8.o flash_attention_v2.o flash_attention_v2_multi_gpu.o flash_attention_v2_optimized.o $(TARGET) $(STATIC_TARGET) $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_MG_TARGET) $(FA2_OPT_TARGET)
 	rm -f rmsnorm_kernel.o ffn_kernel.o embeddings_kernel.o sampling_kernel.o linear_projection.o residual_add.o inference_pipeline.o
 	rm -f $(RMSNORM_TARGET) $(FFN_TARGET) $(EMBEDDINGS_TARGET) $(SAMPLING_TARGET) $(LINEAR_TARGET) $(RESIDUAL_TARGET) $(PIPELINE_TARGET) $(INFERENCE_TARGET)
+	rm -f cublas_matmul.o $(CUBLAS_TARGET)
 	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention $(BIN_DIR)/test_flash_attention_int8 $(BIN_DIR)/test_flash_attention_v2_multi_gpu $(BIN_DIR)/test_flash_attention_v2_optimized
 
 # Install to system (optional)
@@ -378,6 +403,7 @@ info:
 	@echo "INT8 Flash Attention: $(INT8_TARGET)"
 	@echo "FA2 Multi-GPU: $(FA2_MG_TARGET)"
 	@echo "Inference Library: $(INFERENCE_TARGET)"
+	@echo "cuBLAS Full GPU: $(CUBLAS_TARGET)"
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo ""
 	@echo "Build targets:"
@@ -397,6 +423,10 @@ info:
 	@echo "  make jetson-orin - Jetson Orin (sm_87)"
 	@echo "  make rtx        - RTX 30/40 series"
 	@echo ""
+	@echo "Full GPU inference (400+ tok/s target):"
+	@echo "  make cublas     - Build cuBLAS matmul + GQA attention (RECOMMENDED)"
+	@echo "  make gpu-inference - Build complete GPU inference library"
+	@echo ""
 	@echo "Inference pipeline targets:"
 	@echo "  make rmsnorm    - Build RMSNorm kernel"
 	@echo "  make ffn        - Build FFN/MLP kernel (SwiGLU)"
@@ -407,7 +437,7 @@ info:
 	@echo "  make pipeline   - Build inference pipeline orchestrator"
 	@echo "  make inference-all      - Build all inference kernels separately"
 	@echo "  make inference-unified  - Build unified inference library"
-	@echo "  make inference-pipeline - Build complete pipeline (RECOMMENDED)"
+	@echo "  make inference-pipeline - Build complete pipeline"
 	@echo ""
 	@echo "Test targets:"
 	@echo "  make test       - Run T-MAC kernel tests"
