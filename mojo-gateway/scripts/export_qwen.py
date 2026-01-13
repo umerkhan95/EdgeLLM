@@ -39,10 +39,17 @@ def export_qwen(model_id: str, output_path: str):
     vocab_size = config.vocab_size
     seq_len = getattr(config, 'max_position_embeddings', 2048)
 
+    # Get special token IDs
+    eos_token_id = getattr(config, 'eos_token_id', 2)
+    bos_token_id = getattr(config, 'bos_token_id', 1)
+    if bos_token_id is None:
+        bos_token_id = 0  # Use 0 if no BOS (Qwen style)
+
     print(f"Config:")
     print(f"  dim={dim}, hidden_dim={hidden_dim}")
     print(f"  n_layers={n_layers}, n_heads={n_heads}, n_kv_heads={n_kv_heads}")
     print(f"  vocab_size={vocab_size}, seq_len={seq_len}")
+    print(f"  bos_token_id={bos_token_id}, eos_token_id={eos_token_id}")
 
     head_size = dim // n_heads
 
@@ -129,8 +136,10 @@ def export_qwen(model_id: str, output_path: str):
         write_tensor(state_dict['model.norm.weight'], 'rms_final')
 
         # 12 & 13. Precompute RoPE frequencies (freq_cis_real, freq_cis_imag)
-        print("\nComputing freq_cis (RoPE)...")
-        inv_freq = 1.0 / (10000.0 ** (np.arange(0, head_size, 2, dtype=np.float32) / head_size))
+        # CRITICAL: Use model's rope_theta (Qwen uses 1,000,000, not 10,000!)
+        rope_theta = getattr(config, 'rope_theta', 10000.0)
+        print(f"\nComputing freq_cis (RoPE with theta={rope_theta})...")
+        inv_freq = 1.0 / (rope_theta ** (np.arange(0, head_size, 2, dtype=np.float32) / head_size))
         t = np.arange(rope_seq_len, dtype=np.float32)
         freqs = np.outer(t, inv_freq)
         freq_cis_real = np.cos(freqs).astype(np.float32)
@@ -156,14 +165,23 @@ def export_qwen(model_id: str, output_path: str):
 
 
 def export_tokenizer(tokenizer, output_path: str, vocab_size: int):
-    """Export tokenizer to llama.c binary format."""
+    """Export tokenizer to llama.c binary format.
+
+    Format (matching Mojo Tokenizer struct expectations):
+    - [max_token_length: int32]  (NOT vocab_size first!)
+    - For each token (vocab_size times):
+        - [score: float32]
+        - [token_len: int32]
+        - [token_bytes: bytes]
+    """
 
     with open(output_path, 'wb') as f:
-        # Write vocab size and max token length
+        # First pass: collect all tokens and find max length
         max_token_length = 0
         tokens = []
         scores = []
 
+        print(f"  Building tokenizer vocab ({vocab_size} tokens)...")
         for i in range(vocab_size):
             try:
                 token = tokenizer.decode([i])
@@ -175,17 +193,84 @@ def export_tokenizer(tokenizer, output_path: str, vocab_size: int):
             scores.append(0.0)  # Qwen doesn't use scores like SentencePiece
             max_token_length = max(max_token_length, len(token_bytes))
 
-        # Header
-        f.write(struct.pack('i', vocab_size))
+            if i > 0 and i % 50000 == 0:
+                print(f"    Processed {i}/{vocab_size} tokens...")
+
+        # Header: ONLY max_token_length (Mojo expects this, vocab_size comes from model config)
         f.write(struct.pack('i', max_token_length))
 
-        # Write tokens
+        # Write tokens: [score:f32][len:i32][bytes]
         for i, (token_bytes, score) in enumerate(zip(tokens, scores)):
             f.write(struct.pack('f', score))
             f.write(struct.pack('i', len(token_bytes)))
             f.write(token_bytes)
 
-    print(f"Tokenizer exported: {os.path.getsize(output_path) / 1024:.2f} KB")
+    print(f"Tokenizer exported: {os.path.getsize(output_path) / 1024:.2f} KB (max_token_length={max_token_length})")
+
+
+def verify_export(model_path: str):
+    """Verify the exported model file structure."""
+    import numpy as np
+
+    print(f"\n=== Verifying {model_path} ===")
+
+    with open(model_path, 'rb') as f:
+        # Read header
+        header = struct.unpack('iiiiiii', f.read(28))
+        dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len = header
+
+        print(f"Header (28 bytes):")
+        print(f"  dim={dim}, hidden_dim={hidden_dim}")
+        print(f"  n_layers={n_layers}, n_heads={n_heads}, n_kv_heads={n_kv_heads}")
+        print(f"  vocab_size={vocab_size}, seq_len={seq_len}")
+
+        head_size = dim // n_heads
+        kv_dim = n_kv_heads * head_size
+
+        # Expected sizes
+        expected = [
+            ("token_embedding", vocab_size * dim),
+            ("rms_att_weight", n_layers * dim),
+            ("wq", n_layers * dim * dim),
+            ("wk", n_layers * kv_dim * dim),
+            ("wv", n_layers * kv_dim * dim),
+            ("wo", n_layers * dim * dim),
+            ("rms_ffn_weight", n_layers * dim),
+            ("w1", n_layers * hidden_dim * dim),
+            ("w2", n_layers * dim * hidden_dim),
+            ("w3", n_layers * hidden_dim * dim),
+            ("rms_final_weight", dim),
+            ("freq_cis_real", seq_len * head_size // 2),
+            ("freq_cis_imag", seq_len * head_size // 2),
+        ]
+
+        print(f"\nExpected weight structure:")
+        total_expected = 28  # header
+        for name, size in expected:
+            print(f"  {name}: {size:,} floats ({size * 4 / 1024 / 1024:.2f} MB)")
+            total_expected += size * 4
+
+        actual_size = os.path.getsize(model_path)
+        print(f"\nExpected total: {total_expected / 1024 / 1024:.2f} MB")
+        print(f"Actual file size: {actual_size / 1024 / 1024:.2f} MB")
+
+        if abs(actual_size - total_expected) < 100:
+            print("✓ File size matches expected!")
+        else:
+            print(f"✗ Size mismatch: {actual_size - total_expected:,} bytes difference")
+
+        # Read and verify first few weights
+        f.seek(28)  # Skip header
+        embedding_sample = np.frombuffer(f.read(40), dtype=np.float32)
+        print(f"\nFirst 10 embedding values: {embedding_sample[:10]}")
+
+        # Check they're not all zeros or NaN
+        if np.all(embedding_sample == 0):
+            print("✗ WARNING: Embeddings are all zeros!")
+        elif np.any(np.isnan(embedding_sample)):
+            print("✗ WARNING: Embeddings contain NaN!")
+        else:
+            print("✓ Embeddings look valid")
 
 
 if __name__ == '__main__':
@@ -194,6 +279,12 @@ if __name__ == '__main__':
                         help='HuggingFace model ID')
     parser.add_argument('--output', type=str, default='qwen2.5-1.5b.bin',
                         help='Output binary file')
+    parser.add_argument('--verify-only', type=str, default=None,
+                        help='Only verify an existing export file')
     args = parser.parse_args()
 
-    export_qwen(args.model, args.output)
+    if args.verify_only:
+        verify_export(args.verify_only)
+    else:
+        model_path, tokenizer_path = export_qwen(args.model, args.output)
+        verify_export(model_path)

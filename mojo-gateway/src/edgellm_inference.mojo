@@ -839,6 +839,8 @@ fn main() raises:
     var prompt = String("")
     var use_cuda = False
     var lib_dir = "./lib"
+    var bos_token = 1  # Default: SentencePiece BOS
+    var eos_token = 2  # Default: SentencePiece EOS
 
     var args = argv()
     if len(args) >= 2:
@@ -864,6 +866,17 @@ fn main() raises:
         elif args[i] == "--lib" and i + 1 < len(args):
             lib_dir = args[i + 1]
             i += 2
+        elif args[i] == "--eos" and i + 1 < len(args):
+            eos_token = atol(args[i + 1])
+            i += 2
+        elif args[i] == "--bos" and i + 1 < len(args):
+            bos_token = atol(args[i + 1])
+            i += 2
+        elif args[i] == "--qwen":
+            # Qwen uses EOS=151643, no BOS (use 0)
+            eos_token = 151643
+            bos_token = 0
+            i += 1
         else:
             i += 1
 
@@ -907,10 +920,15 @@ fn main() raises:
     print()
     print("Generating", steps, "tokens...")
     print("Temperature:", temperature)
+    print("BOS token:", bos_token, "EOS token:", eos_token)
     print("-" * 60)
     print()
 
-    var token = 1  # BOS
+    # Start with BOS token (or first prompt token if BOS=0/no BOS)
+    var token = bos_token
+    if bos_token == 0 and len(prompt_tokens) > 0:
+        token = prompt_tokens[0]  # Use first prompt token if no BOS
+
     var start_time = time.perf_counter_ns()
     var tokens_generated = 0
 
@@ -921,8 +939,11 @@ fn main() raises:
             transformer_forward(token, pos, config, state, weights)
 
         var next_token: Int
-        if pos < len(prompt_tokens):
-            next_token = prompt_tokens[pos]
+        # For models without BOS (like Qwen), prompt starts at pos 0
+        # For models with BOS, prompt starts at pos 1
+        var prompt_offset = 1 if bos_token != 0 else 0
+        if pos + prompt_offset < len(prompt_tokens):
+            next_token = prompt_tokens[pos + prompt_offset]
         else:
             if temperature == 0.0:
                 next_token = argmax(state.logits, config.vocab_size)
@@ -932,7 +953,8 @@ fn main() raises:
                 softmax(state.logits, 0, config.vocab_size)
                 next_token = sample(state.logits, config.vocab_size)
 
-        if next_token == 1 or next_token == 2:
+        # Check for EOS token (configurable via --eos or --qwen flags)
+        if next_token == eos_token:
             break
 
         print_token(tokenizer, next_token)
