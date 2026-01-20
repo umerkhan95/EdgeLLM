@@ -18,6 +18,11 @@
 #include <cstring>
 #include <cstdint>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <signal.h>
 
 // ============================================================================
 // External CUDA functions
@@ -28,6 +33,13 @@ extern "C" {
     int cublas_upload_int4_weights(const uint8_t*, const half*, size_t, size_t);
     void gpu_configure_int4(int, int, int, int, int, int, int, int, int, int);
     int gpu_forward_int4(int token, int pos);
+
+    // Sampling functions (from inference_with_sampling.cu)
+    int sampling_config_init(int vocab_size, float temperature, int top_k, float top_p, float repetition_penalty);
+    void set_sampling_params(float temperature, int top_k, float top_p, float rep_penalty);
+    int forward_with_sampling(int token, int pos);
+    void reset_past_tokens();
+    void sampling_cleanup_resources();
 }
 
 // ============================================================================
@@ -68,6 +80,26 @@ struct Config {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads;
     int vocab_size, seq_len, head_dim, kv_dim;
 };
+
+// ============================================================================
+// Sampling config
+// ============================================================================
+
+struct SamplingParams {
+    float temperature;
+    int top_k;
+    float top_p;
+    float repetition_penalty;
+};
+
+static SamplingParams g_sampling = {
+    .temperature = 0.7f,
+    .top_k = 40,
+    .top_p = 0.9f,
+    .repetition_penalty = 1.1f
+};
+
+static bool g_sampling_initialized = false;
 
 // ============================================================================
 // Tokenizer (llama.c format)
@@ -311,6 +343,19 @@ void generate(const char* prompt, int max_tokens, Config* cfg, Model* model) {
 
     printf("\n");
 
+    // Initialize sampling if needed
+    if (!g_sampling_initialized && g_sampling.temperature > 0.0f) {
+        sampling_config_init(cfg->vocab_size, g_sampling.temperature,
+                            g_sampling.top_k, g_sampling.top_p,
+                            g_sampling.repetition_penalty);
+        g_sampling_initialized = true;
+    } else if (g_sampling_initialized) {
+        // Update params and reset for new generation
+        set_sampling_params(g_sampling.temperature, g_sampling.top_k,
+                           g_sampling.top_p, g_sampling.repetition_penalty);
+        reset_past_tokens();
+    }
+
     // Prefill: process all tokens except the last
     for (int i = 0; i < n_tokens - 1; i++) {
         gpu_forward_int4(tokens[i], i);
@@ -327,8 +372,12 @@ void generate(const char* prompt, int max_tokens, Config* cfg, Model* model) {
     cudaEventRecord(start);
 
     while (generated < max_tokens) {
-        // Greedy decoding
-        token = gpu_forward_int4(token, pos);
+        // Use sampling if temperature > 0, otherwise greedy
+        if (g_sampling.temperature > 0.0f) {
+            token = forward_with_sampling(token, pos);
+        } else {
+            token = gpu_forward_int4(token, pos);
+        }
         pos++;
         generated++;
 
@@ -350,7 +399,7 @@ void generate(const char* prompt, int max_tokens, Config* cfg, Model* model) {
     float ms;
     cudaEventElapsedTime(&ms, start, end);
 
-    printf("\n\n[%d tokens, %.1f tok/s]\n", generated, generated * 1000.0f / ms);
+    printf("\n\n[%d tokens, %.1f tok/s, temp=%.2f]\n", generated, generated * 1000.0f / ms, g_sampling.temperature);
 }
 
 // ============================================================================
@@ -432,13 +481,439 @@ void print_help() {
     printf("  edge run <model>              Interactive chat\n");
     printf("  edge run <model> -p \"prompt\"  Single generation\n");
     printf("  edge models                   List available models\n");
+    printf("  edge serve <model> [port]     Start HTTP API server\n");
     printf("\nOptions:\n");
     printf("  -n <tokens>   Max tokens to generate (default: 256)\n");
-    printf("  -t <temp>     Temperature (default: 0.7)\n");
+    printf("  -t <temp>     Temperature (default: 0.7, 0=greedy)\n");
+    printf("  -k <top_k>    Top-k sampling (default: 40, 0=disabled)\n");
+    printf("  --top_p <p>   Top-p nucleus sampling (default: 0.9)\n");
+    printf("  --rep_pen <p> Repetition penalty (default: 1.1)\n");
     printf("  -p <prompt>   Single prompt (non-interactive)\n");
     printf("\nExamples:\n");
     printf("  edge run qwen\n");
-    printf("  edge run qwen -p \"What is 2+2?\"\n\n");
+    printf("  edge run qwen -p \"What is 2+2?\"\n");
+    printf("  edge run qwen -t 0.9 -k 50 -p \"Write a poem\"\n");
+    printf("  edge run qwen -t 0                          # Greedy\n");
+    printf("  edge serve qwen 8080                        # HTTP server\n\n");
+}
+
+// ============================================================================
+// HTTP Server for Ollama-compatible API
+// ============================================================================
+
+static volatile bool g_server_running = true;
+static Config* g_server_cfg = nullptr;
+static Model* g_server_model = nullptr;
+static pthread_mutex_t g_inference_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void handle_sigint(int sig) {
+    (void)sig;
+    g_server_running = false;
+    printf("\nShutting down...\n");
+}
+
+// Simple JSON parsing helpers
+static char* json_get_string(const char* json, const char* key, char* buf, size_t bufsize) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* start = strstr(json, pattern);
+    if (!start) return nullptr;
+    start += strlen(pattern);
+    while (*start == ' ' || *start == '\t') start++;
+    if (*start != '"') return nullptr;
+    start++;
+    const char* end = strchr(start, '"');
+    if (!end) return nullptr;
+    size_t len = end - start;
+    if (len >= bufsize) len = bufsize - 1;
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static float json_get_float(const char* json, const char* key, float default_val) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* start = strstr(json, pattern);
+    if (!start) return default_val;
+    start += strlen(pattern);
+    while (*start == ' ' || *start == '\t') start++;
+    return (float)atof(start);
+}
+
+static int json_get_int(const char* json, const char* key, int default_val) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* start = strstr(json, pattern);
+    if (!start) return default_val;
+    start += strlen(pattern);
+    while (*start == ' ' || *start == '\t') start++;
+    return atoi(start);
+}
+
+static bool json_get_bool(const char* json, const char* key, bool default_val) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* start = strstr(json, pattern);
+    if (!start) return default_val;
+    start += strlen(pattern);
+    while (*start == ' ' || *start == '\t') start++;
+    if (strncmp(start, "true", 4) == 0) return true;
+    if (strncmp(start, "false", 5) == 0) return false;
+    return default_val;
+}
+
+// Send HTTP response headers
+static void send_headers(int client_fd, int status, const char* content_type, bool streaming) {
+    char response[512];
+    const char* status_text = (status == 200) ? "OK" : "Bad Request";
+    if (streaming) {
+        snprintf(response, sizeof(response),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n", status, status_text, content_type);
+    } else {
+        snprintf(response, sizeof(response),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n", status, status_text, content_type);
+    }
+    send(client_fd, response, strlen(response), 0);
+}
+
+// Send SSE chunk
+static void send_chunk(int client_fd, const char* data) {
+    char chunk[1024];
+    int len = snprintf(chunk, sizeof(chunk), "%lx\r\n%s\r\n", strlen(data), data);
+    send(client_fd, chunk, len, 0);
+}
+
+// Generate with streaming output
+static void generate_streaming(int client_fd, const char* prompt, int max_tokens, bool stream) {
+    pthread_mutex_lock(&g_inference_mutex);
+
+    // Encode prompt
+    int tokens[2048];
+    int n_tokens = encode_single(prompt, tokens, 2048);
+    if (n_tokens == 0) {
+        pthread_mutex_unlock(&g_inference_mutex);
+        const char* error = "{\"error\":\"failed to encode prompt\"}";
+        if (stream) send_chunk(client_fd, error);
+        else send(client_fd, error, strlen(error), 0);
+        return;
+    }
+
+    // Initialize sampling if needed
+    if (!g_sampling_initialized && g_sampling.temperature > 0.0f) {
+        sampling_config_init(g_server_cfg->vocab_size, g_sampling.temperature,
+                            g_sampling.top_k, g_sampling.top_p,
+                            g_sampling.repetition_penalty);
+        g_sampling_initialized = true;
+    } else if (g_sampling_initialized) {
+        set_sampling_params(g_sampling.temperature, g_sampling.top_k,
+                           g_sampling.top_p, g_sampling.repetition_penalty);
+        reset_past_tokens();
+    }
+
+    // Prefill
+    for (int i = 0; i < n_tokens - 1; i++) {
+        gpu_forward_int4(tokens[i], i);
+    }
+
+    // Generate
+    int token = tokens[n_tokens - 1];
+    int pos = n_tokens - 1;
+    int generated = 0;
+    char response_buf[65536] = "";
+    size_t response_len = 0;
+
+    cudaEvent_t start, end;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+    cudaEventRecord(start);
+
+    while (generated < max_tokens && g_server_running) {
+        if (g_sampling.temperature > 0.0f) {
+            token = forward_with_sampling(token, pos);
+        } else {
+            token = gpu_forward_int4(token, pos);
+        }
+        pos++;
+        generated++;
+
+        const char* text = decode_token(token);
+
+        // Check for EOS
+        if (token == 151643 || token == 151645 || token == 2 ||
+            strstr(text, "<|im_end|>") || strstr(text, "<|eot_id|>")) {
+            break;
+        }
+
+        if (stream) {
+            // Send streaming response (Ollama format)
+            char json[512];
+            // Escape special characters in text
+            char escaped[256];
+            size_t j = 0;
+            for (size_t i = 0; text[i] && j < sizeof(escaped) - 2; i++) {
+                if (text[i] == '"') { escaped[j++] = '\\'; escaped[j++] = '"'; }
+                else if (text[i] == '\\') { escaped[j++] = '\\'; escaped[j++] = '\\'; }
+                else if (text[i] == '\n') { escaped[j++] = '\\'; escaped[j++] = 'n'; }
+                else if (text[i] == '\r') { escaped[j++] = '\\'; escaped[j++] = 'r'; }
+                else if (text[i] == '\t') { escaped[j++] = '\\'; escaped[j++] = 't'; }
+                else escaped[j++] = text[i];
+            }
+            escaped[j] = '\0';
+
+            snprintf(json, sizeof(json),
+                "{\"model\":\"%s\",\"response\":\"%s\",\"done\":false}",
+                g_server_model->name, escaped);
+            send_chunk(client_fd, json);
+            send_chunk(client_fd, "\n");
+        } else {
+            // Accumulate for non-streaming response
+            size_t text_len = strlen(text);
+            if (response_len + text_len < sizeof(response_buf) - 1) {
+                memcpy(response_buf + response_len, text, text_len);
+                response_len += text_len;
+            }
+        }
+    }
+
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+    float ms;
+    cudaEventElapsedTime(&ms, start, end);
+
+    if (stream) {
+        // Send final chunk
+        char final_json[256];
+        snprintf(final_json, sizeof(final_json),
+            "{\"model\":\"%s\",\"response\":\"\",\"done\":true,"
+            "\"total_duration\":%d,\"eval_count\":%d,\"eval_duration\":%d}",
+            g_server_model->name, (int)(ms * 1000000), generated, (int)(ms * 1000000));
+        send_chunk(client_fd, final_json);
+        send_chunk(client_fd, "\n");
+        send(client_fd, "0\r\n\r\n", 5, 0);  // End chunked transfer
+    } else {
+        response_buf[response_len] = '\0';
+        // Escape for JSON
+        char escaped_response[65536];
+        size_t j = 0;
+        for (size_t i = 0; response_buf[i] && j < sizeof(escaped_response) - 2; i++) {
+            if (response_buf[i] == '"') { escaped_response[j++] = '\\'; escaped_response[j++] = '"'; }
+            else if (response_buf[i] == '\\') { escaped_response[j++] = '\\'; escaped_response[j++] = '\\'; }
+            else if (response_buf[i] == '\n') { escaped_response[j++] = '\\'; escaped_response[j++] = 'n'; }
+            else if (response_buf[i] == '\r') { escaped_response[j++] = '\\'; escaped_response[j++] = 'r'; }
+            else if (response_buf[i] == '\t') { escaped_response[j++] = '\\'; escaped_response[j++] = 't'; }
+            else escaped_response[j++] = response_buf[i];
+        }
+        escaped_response[j] = '\0';
+
+        char json[70000];
+        snprintf(json, sizeof(json),
+            "{\"model\":\"%s\",\"response\":\"%s\",\"done\":true,"
+            "\"total_duration\":%d,\"eval_count\":%d,\"eval_duration\":%d}",
+            g_server_model->name, escaped_response, (int)(ms * 1000000), generated, (int)(ms * 1000000));
+        send(client_fd, json, strlen(json), 0);
+    }
+
+    pthread_mutex_unlock(&g_inference_mutex);
+}
+
+// Handle HTTP request
+static void handle_request(int client_fd) {
+    char buffer[65536];
+    ssize_t bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (bytes <= 0) {
+        close(client_fd);
+        return;
+    }
+    buffer[bytes] = '\0';
+
+    // Parse method and path
+    char method[16] = "", path[256] = "";
+    sscanf(buffer, "%15s %255s", method, path);
+
+    // Find body (after \r\n\r\n)
+    const char* body = strstr(buffer, "\r\n\r\n");
+    if (body) body += 4;
+    else body = "";
+
+    // Route: GET /api/tags - List models
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/tags") == 0) {
+        send_headers(client_fd, 200, "application/json", false);
+        char json[1024] = "{\"models\":[";
+        for (int i = 0; MODELS[i].name; i++) {
+            if (i > 0) strcat(json, ",");
+            char model_json[256];
+            snprintf(model_json, sizeof(model_json),
+                "{\"name\":\"%s\",\"size\":0,\"digest\":\"\",\"modified_at\":\"\"}",
+                MODELS[i].name);
+            strcat(json, model_json);
+        }
+        strcat(json, "]}");
+        send(client_fd, json, strlen(json), 0);
+    }
+    // Route: POST /api/generate - Generate text
+    else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/generate") == 0) {
+        char prompt[8192];
+        if (!json_get_string(body, "prompt", prompt, sizeof(prompt))) {
+            send_headers(client_fd, 400, "application/json", false);
+            const char* error = "{\"error\":\"missing prompt\"}";
+            send(client_fd, error, strlen(error), 0);
+            close(client_fd);
+            return;
+        }
+
+        // Parse options
+        g_sampling.temperature = json_get_float(body, "temperature", g_sampling.temperature);
+        g_sampling.top_k = json_get_int(body, "top_k", g_sampling.top_k);
+        g_sampling.top_p = json_get_float(body, "top_p", g_sampling.top_p);
+        g_sampling.repetition_penalty = json_get_float(body, "repeat_penalty", g_sampling.repetition_penalty);
+        int max_tokens = json_get_int(body, "num_predict", 256);
+        bool stream = json_get_bool(body, "stream", true);
+
+        send_headers(client_fd, 200, "application/x-ndjson", stream);
+        generate_streaming(client_fd, prompt, max_tokens, stream);
+    }
+    // Route: POST /api/chat - Chat completion (simplified)
+    else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/chat") == 0) {
+        // Extract last message content (simplified - just gets prompt field)
+        char prompt[8192];
+        const char* messages = strstr(body, "\"messages\"");
+        if (messages) {
+            const char* content = strstr(messages, "\"content\":");
+            if (content) {
+                content += 10;
+                while (*content == ' ' || *content == '"') content++;
+                const char* end = strchr(content, '"');
+                if (end) {
+                    size_t len = end - content;
+                    if (len >= sizeof(prompt)) len = sizeof(prompt) - 1;
+                    memcpy(prompt, content, len);
+                    prompt[len] = '\0';
+                } else {
+                    strcpy(prompt, "Hello");
+                }
+            } else {
+                strcpy(prompt, "Hello");
+            }
+        } else if (!json_get_string(body, "prompt", prompt, sizeof(prompt))) {
+            strcpy(prompt, "Hello");
+        }
+
+        g_sampling.temperature = json_get_float(body, "temperature", g_sampling.temperature);
+        int max_tokens = json_get_int(body, "num_predict", 256);
+        bool stream = json_get_bool(body, "stream", true);
+
+        send_headers(client_fd, 200, "application/x-ndjson", stream);
+        generate_streaming(client_fd, prompt, max_tokens, stream);
+    }
+    // Health check
+    else if (strcmp(method, "GET") == 0 && (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0)) {
+        send_headers(client_fd, 200, "application/json", false);
+        const char* json = "{\"status\":\"ok\"}";
+        send(client_fd, json, strlen(json), 0);
+    }
+    // 404
+    else {
+        send_headers(client_fd, 404, "application/json", false);
+        const char* error = "{\"error\":\"not found\"}";
+        send(client_fd, error, strlen(error), 0);
+    }
+
+    close(client_fd);
+}
+
+void cmd_serve(const char* model_name, int port) {
+    Model* model = find_model(model_name);
+    if (!model) {
+        fprintf(stderr, "error: unknown model '%s'\n", model_name);
+        cmd_models();
+        return;
+    }
+
+    if (access(model->path, F_OK) != 0) {
+        fprintf(stderr, "error: model file not found: %s\n", model->path);
+        return;
+    }
+    if (access(model->tokenizer, F_OK) != 0) {
+        fprintf(stderr, "error: tokenizer not found: %s\n", model->tokenizer);
+        return;
+    }
+
+    printf("Loading %s...\n", model->name);
+
+    static Config cfg;
+    if (load_model(model->path, &cfg) != 0) return;
+    if (load_tokenizer(model->tokenizer, cfg.vocab_size) != 0) return;
+    if (init_gpu(&cfg) != 0) return;
+
+    g_server_cfg = &cfg;
+    g_server_model = model;
+
+    // Create socket
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        fprintf(stderr, "error: failed to create socket\n");
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "error: failed to bind to port %d\n", port);
+        close(server_fd);
+        return;
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        fprintf(stderr, "error: failed to listen\n");
+        close(server_fd);
+        return;
+    }
+
+    signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
+
+    printf("\n");
+    printf("EdgeLLM server running at http://localhost:%d\n", port);
+    printf("Model: %s (temp=%.2f, top_k=%d, top_p=%.2f)\n",
+           model->name, g_sampling.temperature, g_sampling.top_k, g_sampling.top_p);
+    printf("\nEndpoints:\n");
+    printf("  GET  /api/tags      List available models\n");
+    printf("  POST /api/generate  Generate text\n");
+    printf("  POST /api/chat      Chat completion\n");
+    printf("  GET  /health        Health check\n");
+    printf("\nPress Ctrl+C to stop.\n\n");
+
+    while (g_server_running) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) {
+            if (g_server_running) {
+                fprintf(stderr, "warning: accept failed\n");
+            }
+            continue;
+        }
+
+        handle_request(client_fd);
+    }
+
+    close(server_fd);
+    printf("Server stopped.\n");
 }
 
 // ============================================================================
@@ -468,7 +943,6 @@ int main(int argc, char** argv) {
         const char* model = argv[2];
         const char* prompt = nullptr;
         int max_tokens = 256;
-        float temperature = 0.7f;
 
         // Parse options
         for (int i = 3; i < argc; i++) {
@@ -477,11 +951,49 @@ int main(int argc, char** argv) {
             } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
                 max_tokens = atoi(argv[++i]);
             } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-                temperature = atof(argv[++i]);
+                g_sampling.temperature = atof(argv[++i]);
+            } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+                g_sampling.top_k = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--top_p") == 0 && i + 1 < argc) {
+                g_sampling.top_p = atof(argv[++i]);
+            } else if (strcmp(argv[i], "--rep_pen") == 0 && i + 1 < argc) {
+                g_sampling.repetition_penalty = atof(argv[++i]);
             }
         }
 
         cmd_run(model, prompt, max_tokens);
+        return 0;
+    }
+
+    if (strcmp(cmd, "serve") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "error: missing model name\n");
+            print_help();
+            return 1;
+        }
+
+        const char* model = argv[2];
+        int port = 11434;  // Default Ollama port
+
+        // Parse options
+        for (int i = 3; i < argc; i++) {
+            if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc) {
+                port = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+                g_sampling.temperature = atof(argv[++i]);
+            } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+                g_sampling.top_k = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--top_p") == 0 && i + 1 < argc) {
+                g_sampling.top_p = atof(argv[++i]);
+            } else if (strcmp(argv[i], "--rep_pen") == 0 && i + 1 < argc) {
+                g_sampling.repetition_penalty = atof(argv[++i]);
+            } else if (argv[i][0] != '-') {
+                // Positional argument - could be port
+                port = atoi(argv[i]);
+            }
+        }
+
+        cmd_serve(model, port);
         return 0;
     }
 
